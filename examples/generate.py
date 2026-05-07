@@ -314,7 +314,7 @@ def build_input_spec() -> DatasetInputSpec:
     )
 
 def main() -> None:
-    n_samples = 1000
+    n_samples = 100
     chunk_size = 100
     n_threads = 8
     output_dir = Path("examples/datasets/bzcy_1000")

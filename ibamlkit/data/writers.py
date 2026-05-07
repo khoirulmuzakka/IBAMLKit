@@ -7,7 +7,7 @@ import json
 import numpy as np
 
 from ..schema import IBADataset
-from ..standards.constants import (
+from ..schema.constants import (
     DATASET_FORMAT_NAME,
     ROOT_ATTR_FORMAT,
     ROOT_ATTR_VERSION,

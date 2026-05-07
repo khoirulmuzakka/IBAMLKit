@@ -10,7 +10,7 @@ import numpy as np
 
 from .layers import LayerSpeciesSpec
 from .setup import MethodSpec
-from ..standards.versions import DATASET_FORMAT_VERSION
+from .versions import DATASET_FORMAT_VERSION
 
 
 @dataclass(frozen=True)
