@@ -113,13 +113,19 @@ class _SIMNRAMethodSession:
 
     def _open_reference(self) -> None:
         if not self.simnra.App.Open(self._temp_reference_path, -1):
-            message = str(self.simnra.App.LastMessage)
+            message = self._last_message()
             raise RuntimeError(
                 f"SIMNRA failed to open reference file for method '{self.method_name}': {message}"
             )
 
         self.simnra.Calc.ElementSpectra = True
         self.simnra.Fit.Chi2Evaluation = 0
+
+    def _last_message(self) -> str:
+        message = getattr(self.simnra.App, "LastMessage", "")
+        if message is None:
+            raise RuntimeError("SIMNRA did not provide an error message.")
+        return str(message).strip()
 
     def _build_layer_blueprints(self) -> list[_LayerBlueprint]:
         by_layer: dict[int, list[str]] = {}
@@ -300,7 +306,14 @@ class _SIMNRAMethodSession:
     def generate_spectrum(self, full_parameter_values: Mapping[str, float]) -> np.ndarray:
         self._apply_setup_parameters(full_parameter_values)
         self._apply_layer_parameters(full_parameter_values)
-        self.simnra.App.CalculateSpectrum()
+        result = self.simnra.App.CalculateSpectrum()
+        if not result:
+            message = self._last_message()
+            if not message:
+                message = "Unknown SIMNRA error."
+            raise RuntimeError(
+                f"SIMNRA CalculateSpectrum failed for method '{self.method_name}': {message}"
+            )
         return np.asarray(self.simnra.Spectrum.GetDataArray(2), dtype=np.float32)
 
 
