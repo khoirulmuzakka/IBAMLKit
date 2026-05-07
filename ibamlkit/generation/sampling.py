@@ -45,9 +45,11 @@ The anchor library is built once per layer size and may contain:
   - ``30/70``
 
 The parameter ``anchor_fraction`` controls what fraction of requested samples
-is taken from this anchor library. The anchor vectors themselves are
-deterministic; the only randomness is which anchors are selected for the
-current batch.
+is taken from this anchor library. When the requested anchor count exceeds the
+number of distinct anchors, the library is repeated as many times as needed
+and the final partial cycle is filled by a random subset. The anchor vectors
+themselves are deterministic; the only randomness is their order and any
+partial-cycle subset selection.
 
 Random modes
 ------------
@@ -101,7 +103,7 @@ class LayerConcentrationSamplingConfig:
     the anchor fraction.
     """
 
-    anchor_fraction: float = 0.2
+    anchor_fraction: float = 0.1
     pure_weight: float = 0.1
     single_dominant_weight: float = 0.35
     double_dominant_weight: float = 0.3
@@ -206,10 +208,13 @@ def sample_layer_concentrations(
     samples = np.zeros((n_samples, n_elements), dtype=np.float32)
 
     anchors = _build_anchor_library(n_elements=n_elements, total=total, config=cfg)
-    n_anchor = min(n_samples, len(anchors), int(round(cfg.anchor_fraction * n_samples)))
+    n_anchor = min(n_samples, int(round(cfg.anchor_fraction * n_samples)))
     if n_anchor > 0:
-        chosen = rng.choice(len(anchors), size=n_anchor, replace=False)
-        samples[:n_anchor] = anchors[chosen]
+        samples[:n_anchor] = _sample_anchor_rows(
+            anchors=anchors,
+            n_anchor=n_anchor,
+            rng=rng,
+        )
 
     if n_anchor == n_samples:
         return samples
@@ -313,6 +318,39 @@ def _build_anchor_library(
     if not rows:
         return np.zeros((0, n_elements), dtype=np.float32)
     return np.stack(rows, axis=0)
+
+
+def _sample_anchor_rows(
+    anchors: np.ndarray,
+    n_anchor: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample anchor rows while preserving the requested anchor fraction.
+
+    If the anchor library is smaller than ``n_anchor``, repeat the full
+    library as many times as needed and fill the remaining rows with a random
+    subset sampled without replacement. The resulting anchor rows are shuffled
+    so that repeated anchors are not grouped by cycle.
+    """
+    if n_anchor <= 0:
+        return np.zeros((0, anchors.shape[1]), dtype=np.float32)
+    if len(anchors) == 0:
+        raise ValueError("Cannot draw anchor samples from an empty anchor library.")
+
+    library_size = len(anchors)
+    full_cycles = n_anchor // library_size
+    remainder = n_anchor % library_size
+
+    chunks: list[np.ndarray] = []
+    if full_cycles > 0:
+        chunks.append(np.tile(anchors, (full_cycles, 1)))
+    if remainder > 0:
+        chosen = rng.choice(library_size, size=remainder, replace=False)
+        chunks.append(anchors[chosen])
+
+    sampled = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, anchors.shape[1]), dtype=np.float32)
+    permutation = rng.permutation(len(sampled))
+    return sampled[permutation]
 
 
 def _sample_mode(

@@ -1,29 +1,48 @@
-"""Example: generate variable-layer datasets with GRR-style thickness bounds.
+"""Example: generate 1-layer to N-layer training datasets.
 
-This script mirrors the core idea of the old ``DataGenerator_GRR``:
+This script generates one dataset per layer count:
 
-- loop from 1 layer up to a requested maximum layer count
-- duplicate one base layer composition across all layers
-- keep setup parameters unchanged
-- expand layer parameters per layer index
-- sample open parameters
-- generate one dataset family per layer count
+- 1 layer
+- 2 layers
+- ...
+- max_layers
 
-The thickness handling follows the old GRR logic:
+Each case produces ``n_samples_per_case`` samples and writes a single HDF5 file
+because the sample count is intentionally small.
 
-- a target thickness list is computed from ``calc_thicknesses()``
-- for every free thickness parameter in layer ``i``:
-  - default value = ``0.5 * target_thickness[i]``
-  - lower bound = ``50``
-  - upper bound = ``target_thickness[i]``
-- fixed thickness parameters stay fixed
+Thickness sampling policy
+-------------------------
+
+Thickness parameter bounds are defined first:
+
+- every layer thickness lower bound is ``0.0``
+- thickness upper bounds increase strictly with depth
+- the upper-bound profile uses exponential scaling
+- the sum of the per-layer upper bounds grows from ``5e4`` for the 1-layer
+  case to ``7e5`` for the ``max_layers`` case
+
+Thickness values are then sampled in two stages:
+
+1. Sample the total envelope thickness.
+2. Build exponentially increasing per-layer envelope bounds whose sum equals
+   that sampled total.
+3. Sample each actual layer thickness independently inside its own envelope.
+
+This gives:
+
+- strictly increasing thickness envelopes with depth
+- no rejection step
+- thinner surface layers and broader deep-layer thickness ranges
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
+import sys 
+sys.path.append("../")
 
 from ibamlkit.generation import (
     LayerConcentrationSamplingConfig,
@@ -37,12 +56,12 @@ def build_methods() -> list[MethodSpec]:
     return [
         MethodSpec(
             name="NRA",
-            reference_file="../Ref_nra_nopu.xnra",
+            reference_file="D:/Developments/IBAMLKit/xnra/Ref_nra_nopu.xnra",
             file_type="SIMNRA",
         ),
         MethodSpec(
             name="RBS",
-            reference_file="../Ref_rbs_nopu.xnra",
+            reference_file="D:/Developments/IBAMLKit/xnra/Ref_rbs_nopu.xnra",
             file_type="SIMNRA",
         ),
     ]
@@ -190,244 +209,269 @@ def build_setup_parameters() -> list[ParameterSpec]:
     ]
 
 
-def build_base_layer_species() -> list[str]:
+def build_layer_elements() -> list[str]:
     return ["C", "O", "Y", "Zr", "Ba", "Ce", "D"]
 
 
-def build_base_layer_parameters() -> list[ParameterSpec]:
+def make_layer_species(n_layers: int, elements: Sequence[str]) -> list[LayerSpeciesSpec]:
     return [
-        ParameterSpec(
-            name="Thickness",
-            group="layer",
-            kind="thickness",
-            layer_index=1,
-            is_open=True,
-            lower_bound=10.0,
-            upper_bound=2000.0,
-            unit="1e15 at/cm2",
-        ),
-        ParameterSpec(
-            name="Conc_C",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="C",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_O",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="O",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_Y",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="Y",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_Zr",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="Zr",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_Ba",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="Ba",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_Ce",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="Ce",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
-        ParameterSpec(
-            name="Conc_D",
-            group="layer",
-            kind="concentration",
-            layer_index=1,
-            element="D",
-            is_open=True,
-            lower_bound=0.0,
-            upper_bound=1.0,
-        ),
+        LayerSpeciesSpec(layer_index=layer_index, element=element)
+        for layer_index in range(1, n_layers + 1)
+        for element in elements
     ]
-
-
-def calc_thicknesses(
-    n_layers: int,
-    thickness_min: float = 50.0,
-    thickness_max: float = 500000.0,
-) -> list[float]:
-    """Replicate the old GRR ``calcThickness`` ramp."""
-
-    _ = thickness_min
-    t_max = thickness_max + 0.25 * thickness_max
-    return [2.0 * i * t_max / (n_layers * (n_layers + 1)) for i in range(1, n_layers + 1)]
-
-
-def make_layer_species(n_layers: int, base_elements: Sequence[str]) -> list[LayerSpeciesSpec]:
-    layer_species: list[LayerSpeciesSpec] = []
-    for layer_index in range(1, n_layers + 1):
-        for element in base_elements:
-            layer_species.append(LayerSpeciesSpec(layer_index=layer_index, element=element))
-    return layer_species
 
 
 def make_layer_parameters(
     n_layers: int,
-    base_layer_parameters: Sequence[ParameterSpec],
+    elements: Sequence[str],
+    thickness_upper_bounds_per_layer: Sequence[float],
 ) -> list[ParameterSpec]:
-    """Expand one base-layer parameter list across ``n_layers``.
-
-    This follows the old GRR rule for free thickness parameters:
-
-    - default = 0.5 * target thickness
-    - lower bound = 50
-    - upper bound = target thickness
-    """
-
-    thickness_targets = calc_thicknesses(n_layers)
     parameters: list[ParameterSpec] = []
-
     for layer_index in range(1, n_layers + 1):
-        for template in base_layer_parameters:
-            if template.kind == "thickness":
-                target = thickness_targets[layer_index - 1]
-                if template.is_open:
-                    parameters.append(
-                        ParameterSpec(
-                            name=f"Thickness_{layer_index}",
-                            group="layer",
-                            kind="thickness",
-                            layer_index=layer_index,
-                            is_open=True,
-                            lower_bound=50.0,
-                            upper_bound=target,
-                            unit=template.unit,
-                        )
-                    )
-                else:
-                    parameters.append(
-                        ParameterSpec(
-                            name=f"Thickness_{layer_index}",
-                            group="layer",
-                            kind="thickness",
-                            layer_index=layer_index,
-                            is_open=False,
-                            lower_bound=template.lower_bound,
-                            upper_bound=template.upper_bound,
-                            fixed_value=template.fixed_value,
-                            unit=template.unit,
-                        )
-                    )
-                continue
-
+        parameters.append(
+            ParameterSpec(
+                name=f"Thickness_{layer_index}",
+                group="layer",
+                kind="thickness",
+                layer_index=layer_index,
+                is_open=True,
+                lower_bound=0.0,
+                upper_bound=float(thickness_upper_bounds_per_layer[layer_index - 1]),
+                unit="1e15 at/cm2",
+            )
+        )
+        for element in elements:
             parameters.append(
-                replace(
-                    template,
-                    name=f"{template.name}_{layer_index}" if not template.name.startswith("Conc_") else f"{template.name.split('_')[0]}_{layer_index}_{template.element}",
+                ParameterSpec(
+                    name=f"Conc_{layer_index}_{element}",
+                    group="layer",
+                    kind="concentration",
                     layer_index=layer_index,
+                    element=element,
+                    is_open=True,
+                    lower_bound=0.0,
+                    upper_bound=1.0,
                 )
             )
-
     return parameters
 
 
-def build_input_spec_for_layer_count(
+def build_input_spec(
     n_layers: int,
     methods: Sequence[MethodSpec],
     setup_parameters: Sequence[ParameterSpec],
-    base_elements: Sequence[str],
-    base_layer_parameters: Sequence[ParameterSpec],
+    elements: Sequence[str],
+    thickness_upper_bounds_per_layer: Sequence[float],
 ) -> DatasetInputSpec:
     return DatasetInputSpec(
         methods=list(methods),
-        layer_species=make_layer_species(n_layers, base_elements),
-        parameters=list(setup_parameters) + make_layer_parameters(n_layers, base_layer_parameters),
+        layer_species=make_layer_species(n_layers, elements),
+        parameters=list(setup_parameters)
+        + make_layer_parameters(
+            n_layers,
+            elements,
+            thickness_upper_bounds_per_layer=thickness_upper_bounds_per_layer,
+        ),
         generation_info={
-            "example": "multilayer GRR-style generation",
+            "example": "variable-layer generation",
             "n_layers": n_layers,
-            "thickness_rule": "default=0.5*target, lower=50, upper=target for free thickness parameters",
+            "n_elements_per_layer": len(elements),
+            "thickness_policy": (
+                "lower bounds are 0.0; upper bounds increase exponentially with depth; "
+                "sample total envelope thickness first, then sample each layer thickness "
+                "independently within its exponentially scaled envelope"
+            ),
         },
     )
 
 
+def total_thickness_upper_sum(
+    n_layers: int,
+    max_layers: int,
+    total_min_sum: float,
+    total_max_sum: float,
+) -> float:
+    """Interpolate the total thickness envelope from 1-layer to max-layer cases."""
+
+    if max_layers <= 1:
+        return total_max_sum
+    fraction = (n_layers - 1) / (max_layers - 1)
+    return total_min_sum + fraction * (total_max_sum - total_min_sum)
+
+
+def thickness_upper_bounds(
+    n_layers: int,
+    max_layers: int,
+    total_min_sum: float,
+    total_max_sum: float,
+    growth_ratio: float,
+) -> np.ndarray:
+    """Build strictly increasing exponential upper bounds for layer thicknesses."""
+
+    total_upper = total_thickness_upper_sum(
+        n_layers=n_layers,
+        max_layers=max_layers,
+        total_min_sum=total_min_sum,
+        total_max_sum=total_max_sum,
+    )
+    raw = np.asarray([growth_ratio ** layer_index for layer_index in range(n_layers)], dtype=np.float64)
+    bounds = total_upper * raw / raw.sum()
+    return bounds.astype(np.float32)
+
+
+def sample_thickness_matrix(
+    n_samples: int,
+    n_layers: int,
+    rng: np.random.Generator,
+    total_min_sum: float,
+    total_max_sum: float,
+    growth_ratio: float,
+) -> np.ndarray:
+    """Sample thicknesses from per-sample exponentially scaled envelopes.
+
+    For each sample:
+
+    1. Sample a total envelope thickness ``T`` from
+       ``[total_min_sum, total_max_sum]``.
+    2. Split that envelope into strictly increasing exponential upper bounds
+       ``t_1 < t_2 < ... < t_N`` such that ``sum_i t_i = T``.
+    3. Sample each actual thickness independently from ``[0, t_i]``.
+    """
+
+    if n_layers < 1:
+        raise ValueError("n_layers must be >= 1.")
+
+    thicknesses = np.zeros((n_samples, n_layers), dtype=np.float32)
+    raw = np.asarray([growth_ratio ** layer_index for layer_index in range(n_layers)], dtype=np.float64)
+    raw = raw / raw.sum()
+
+    for row_index in range(n_samples):
+        total_envelope = float(rng.uniform(total_min_sum, total_max_sum))
+        layer_envelopes = total_envelope * raw
+        thicknesses[row_index, :] = rng.uniform(
+            low=0.0,
+            high=layer_envelopes,
+            size=n_layers,
+        ).astype(np.float32)
+
+    return thicknesses
+
+
+def apply_thickness_samples(
+    sampled: np.ndarray,
+    input_spec: DatasetInputSpec,
+    thicknesses: np.ndarray,
+) -> None:
+    open_parameters = list(input_spec.open_parameters)
+    thickness_columns = [
+        index
+        for index, parameter in enumerate(open_parameters)
+        if parameter.group == "layer" and parameter.kind == "thickness"
+    ]
+    if len(thickness_columns) != thicknesses.shape[1]:
+        raise ValueError("Thickness column count does not match the number of layers.")
+    sampled[:, thickness_columns] = thicknesses
+
+
+def build_layer_sampling_config(
+    n_layers: int,
+    default_config: LayerConcentrationSamplingConfig,
+    single_layer_config: LayerConcentrationSamplingConfig,
+) -> dict[int, LayerConcentrationSamplingConfig]:
+    if n_layers == 1:
+        return {1: single_layer_config}
+    return {layer_index: default_config for layer_index in range(1, n_layers + 1)}
+
+
 def main() -> None:
-    max_layers = 5
-    n_samples = 1000
+    max_layers = 10
+    n_samples_per_case = [100 for _ in range(max_layers)]
     n_threads = 8
-    chunk_size = 250
-    output_root = Path("examples/datasets/multilayer")
+    progress_every = 100
+    thickness_growth_ratio = 1.6
+    total_thickness_min_sum = 5.0e4
+    total_thickness_max_sum = 7.0e5
+    output_root = Path("datasets/multilayer")
+    default_layer_sampling = LayerConcentrationSamplingConfig(
+        anchor_fraction=0.1,
+        pure_weight=0.15,
+        single_dominant_weight=0.45,
+        double_dominant_weight=0.25,
+        triple_dominant_weight=0.0,
+        sparse_tail_weight=0.1,
+        balanced_weight=0.05,
+        max_minor_active=1,
+    )
+    single_layer_sampling = LayerConcentrationSamplingConfig(
+        anchor_fraction=0.1,
+        pure_weight=0.3,
+        single_dominant_weight=0.45,
+        double_dominant_weight=0.25,
+        triple_dominant_weight=0.0,
+        sparse_tail_weight=0.1,
+        balanced_weight=0.05,
+        max_minor_active=1,
+    )
 
     methods = build_methods()
     setup_parameters = build_setup_parameters()
-    base_elements = build_base_layer_species()
-    base_layer_parameters = build_base_layer_parameters()
+    elements = build_layer_elements()
+
+    if len(n_samples_per_case) != max_layers:
+        raise ValueError("n_samples_per_case must define one entry for each layer-count case.")
 
     for n_layers in range(1, max_layers + 1):
-        input_spec = build_input_spec_for_layer_count(
+        case_sample_count = int(n_samples_per_case[n_layers - 1])
+        upper_bounds = thickness_upper_bounds(
+            n_layers=n_layers,
+            max_layers=max_layers,
+            total_min_sum=total_thickness_min_sum,
+            total_max_sum=total_thickness_max_sum,
+            growth_ratio=thickness_growth_ratio,
+        )
+        input_spec = build_input_spec(
             n_layers=n_layers,
             methods=methods,
             setup_parameters=setup_parameters,
-            base_elements=base_elements,
-            base_layer_parameters=base_layer_parameters,
+            elements=elements,
+            thickness_upper_bounds_per_layer=upper_bounds,
         )
 
+        rng = np.random.default_rng(n_layers)
         sampled = sample_open_parameter_matrix(
             input_spec,
-            n_samples=(2 * n_samples if n_layers == 1 else n_samples),
+            n_samples=case_sample_count,
             seed=n_layers,
-            layer_sampling={
-                layer_index: LayerConcentrationSamplingConfig(
-                    anchor_fraction=0.2,
-                    pure_weight=0.0,
-                    single_dominant_weight=0.4,
-                    double_dominant_weight=0.3,
-                    triple_dominant_weight=0.1,
-                    sparse_tail_weight=0.15,
-                    balanced_weight=0.05,
-                    max_minor_active=3,
-                )
-                for layer_index in range(1, n_layers + 1)
-            },
+            layer_sampling=build_layer_sampling_config(
+                n_layers=n_layers,
+                default_config=default_layer_sampling,
+                single_layer_config=single_layer_sampling,
+            ),
         )
+        thicknesses = sample_thickness_matrix(
+            n_samples=case_sample_count,
+            n_layers=n_layers,
+            rng=rng,
+            total_min_sum=total_thickness_min_sum,
+            total_max_sum=float(upper_bounds.sum()),
+            growth_ratio=thickness_growth_ratio,
+        )
+        apply_thickness_samples(sampled, input_spec, thicknesses)
 
-        generator = SIMNRASpectrumGenerator(input_spec=input_spec, max_workers=n_threads)
+        generator = SIMNRASpectrumGenerator(
+            input_spec=input_spec,
+            max_workers=n_threads,
+            progress_every=progress_every,
+            print_progress=True,
+        )
         output_dir = output_root / f"layers_{n_layers}"
         written = generator.generate_to_files(
             open_parameter_values=sampled,
             output_dir=str(output_dir),
             base_name=f"multilayer_{n_layers}",
-            chunk_size=chunk_size,
-            sample_ids=[f"layers-{n_layers:02d}-{index:06d}" for index in range(sampled.shape[0])],
+            chunk_size=case_sample_count,
+            sample_ids=[f"layers-{n_layers:02d}-{index:06d}" for index in range(case_sample_count)],
         )
-
         print(f"{n_layers} layer(s): wrote {len(written)} file(s) to {output_dir}")
 
 
