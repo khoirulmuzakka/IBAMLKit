@@ -56,12 +56,12 @@ def build_methods() -> list[MethodSpec]:
     return [
         MethodSpec(
             name="NRA",
-            reference_file="D:/Developments/IBAMLKit/xnra/Ref_nra_nopu.xnra",
+            reference_file="D:/IBAMLKit/xnra/Ref_all_nra_nopu.xnra",
             file_type="SIMNRA",
         ),
         MethodSpec(
             name="RBS",
-            reference_file="D:/Developments/IBAMLKit/xnra/Ref_rbs_nopu.xnra",
+            reference_file="D:/IBAMLKit/xnra/Ref_all_rbs_nopu.xnra",
             file_type="SIMNRA",
         ),
     ]
@@ -77,7 +77,7 @@ def build_setup_parameters() -> list[ParameterSpec]:
             is_open=False,
             lower_bound=2655.0,
             upper_bound=3245.0,
-            fixed_value=2950.0,
+            fixed_value=2974.0,
             unit="keV",
         ),
         ParameterSpec(
@@ -215,7 +215,7 @@ def build_setup_parameters() -> list[ParameterSpec]:
 
 
 def build_layer_elements() -> list[str]:
-    return ["C", "O", "Y", "Zr", "Ba", "Ce", "D"]
+    return ["Li", "C", "O", "F", "Si", "P",  "Fe", "Al", "Mn", "Sr", "Ti", "K", "Ca" , "Cu"]
 
 
 def make_layer_species(n_layers: int, elements: Sequence[str]) -> list[LayerSpeciesSpec]:
@@ -389,30 +389,30 @@ def build_layer_sampling_config(
 
 
 def main() -> None:
-    max_layers = 5
-    n_samples_per_case = [3000 for _ in range(max_layers)]
-    n_threads = 4
-    progress_every = 200
+    max_layers = 10
+    n_samples_per_case = [150000 for _ in range(max_layers)]
+    n_threads = 64
+    progress_every = 10000
     thickness_growth_ratio = 1.6
     total_thickness_min_sum = 5.0e4
     total_thickness_max_sum = 7.0e5
-    output_root = Path("datasets/multilayer")
+    output_root = Path("datasets/multilayer_14_elements")
     default_layer_sampling = LayerConcentrationSamplingConfig(
-        anchor_fraction=0.1,
+        anchor_fraction=0.05,
         pure_weight=0.15,
         single_dominant_weight=0.45,
         double_dominant_weight=0.25,
-        triple_dominant_weight=0.0,
+        triple_dominant_weight=0.05,
         sparse_tail_weight=0.1,
         balanced_weight=0.05,
         max_minor_active=1,
     )
     single_layer_sampling = LayerConcentrationSamplingConfig(
-        anchor_fraction=0.1,
-        pure_weight=0.3,
+        anchor_fraction=0.05,
+        pure_weight=0.1,
         single_dominant_weight=0.45,
         double_dominant_weight=0.25,
-        triple_dominant_weight=0.0,
+        triple_dominant_weight=0.05,
         sparse_tail_weight=0.1,
         balanced_weight=0.05,
         max_minor_active=1,
@@ -468,6 +468,10 @@ def main() -> None:
             max_workers=n_threads,
             progress_every=progress_every,
             print_progress=True,
+            simnra_retry_limit=3,
+            allow_failed_samples=True,
+            log_concentration_corrections=True,
+            concentration_correction_threshold=1e-4,
         )
         output_dir = output_root / f"layers_{n_layers}"
         written = generator.generate_to_files(

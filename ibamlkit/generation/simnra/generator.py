@@ -59,9 +59,17 @@ class GenerationFailure:
 class _SIMNRAMethodSession:
     """One thread-local SIMNRA session for a single method."""
 
-    def __init__(self, input_spec: DatasetInputSpec, method_name: str):
+    def __init__(
+        self,
+        input_spec: DatasetInputSpec,
+        method_name: str,
+        log_concentration_corrections: bool = False,
+        concentration_correction_threshold: float = 1e-3,
+    ):
         self.input_spec = input_spec
         self.method_name = method_name
+        self.log_concentration_corrections = bool(log_concentration_corrections)
+        self.concentration_correction_threshold = max(0.0, float(concentration_correction_threshold))
         self.method_spec = next(method for method in input_spec.methods if method.name == method_name)
         self._temp_reference_path = self._copy_reference_file()
         self.simnra = SIMNRA()
@@ -127,6 +135,11 @@ class _SIMNRAMethodSession:
             raise RuntimeError("SIMNRA did not provide an error message.")
         return str(message).strip()
 
+    def _emit_warning(self, message: str) -> None:
+        if not self.log_concentration_corrections:
+            return
+        print(f"[warning] {message}")
+
     def _build_layer_blueprints(self) -> list[_LayerBlueprint]:
         by_layer: dict[int, list[str]] = {}
         for entry in self.input_spec.layer_species:
@@ -182,6 +195,41 @@ class _SIMNRAMethodSession:
             return 0.5 * (parameter.lower_bound + parameter.upper_bound)
         return 0.0
 
+    def _initial_layer_concentrations(self, layer_index: int, elements: Sequence[str]) -> list[float]:
+        layer_parameters = self._concentration_params.get(layer_index, [])
+        by_element = {
+            parameter.element: parameter
+            for parameter in layer_parameters
+        }
+
+        concentrations = [0.0] * len(elements)
+        open_indexes: list[int] = []
+        fixed_total = 0.0
+
+        for index, element in enumerate(elements):
+            parameter = by_element.get(element)
+            if parameter is None:
+                open_indexes.append(index)
+                continue
+            if parameter.fixed_value is not None:
+                value = float(parameter.fixed_value)
+                concentrations[index] = value
+                fixed_total += value
+            else:
+                open_indexes.append(index)
+
+        remaining = max(0.0, 1.0 - fixed_total)
+        if open_indexes:
+            fill_value = remaining / len(open_indexes)
+            for index in open_indexes:
+                concentrations[index] = fill_value
+
+        return self._normalize_layer_concentrations(
+            concentrations,
+            layer_index,
+            self.method_name,
+        )
+
     def _initial_thickness(self, layer_index: int) -> float:
         matches = [
             parameter
@@ -199,6 +247,47 @@ class _SIMNRAMethodSession:
             return 0.5 * (parameter.lower_bound + parameter.upper_bound)
         return 1.0
 
+    def _normalize_layer_concentrations(
+        self,
+        concentrations: Sequence[float],
+        layer_index: int,
+        method_name: str | None = None,
+    ) -> list[float]:
+        original = np.asarray(concentrations, dtype=np.float64)
+        normalized = original.copy()
+        if normalized.ndim != 1 or normalized.size == 0:
+            raise ValueError(f"Layer {layer_index} must define at least one concentration.")
+
+        normalized = np.clip(normalized, 0.0, None)
+        concentration_sum = float(normalized.sum(dtype=np.float64))
+        if concentration_sum <= 0.0:
+            normalized.fill(1.0 / normalized.size)
+        else:
+            normalized /= concentration_sum
+
+        if normalized.size > 1:
+            normalized[:-1] = np.clip(normalized[:-1], 0.0, 1.0)
+            normalized[-1] = max(0.0, 1.0 - float(normalized[:-1].sum(dtype=np.float64)))
+            tail_sum = float(normalized.sum(dtype=np.float64))
+            if tail_sum <= 0.0:
+                normalized.fill(1.0 / normalized.size)
+            elif abs(tail_sum - 1.0) > 1e-12:
+                normalized /= tail_sum
+                normalized[-1] = max(0.0, 1.0 - float(normalized[:-1].sum(dtype=np.float64)))
+
+        max_delta = float(np.max(np.abs(normalized - original)))
+        sum_delta = abs(float(original.sum(dtype=np.float64)) - 1.0)
+        if max(max_delta, sum_delta) >= self.concentration_correction_threshold:
+            method_label = f" for method '{method_name}'" if method_name else ""
+            self._emit_warning(
+                "Normalized concentrations"
+                f"{method_label} in layer {layer_index}: "
+                f"sum {float(original.sum(dtype=np.float64)):.12g} -> 1.0, "
+                f"max delta {max_delta:.6g}"
+            )
+
+        return normalized.tolist()
+
     def _initialize_target_structure(self) -> None:
         reference_layer_count = int(self.simnra.Target.NumberOfLayers)
 
@@ -211,18 +300,12 @@ class _SIMNRAMethodSession:
                 self._initial_thickness(blueprint.layer_index),
             )
 
-            concentrations = []
             for element_index, element in enumerate(blueprint.elements, start=1):
                 self.simnra.Target.SetElementName(simnra_layer_index, element_index, element)
-                concentrations.append(
-                    self._initial_layer_concentration(blueprint.layer_index, element)
-                )
-
-            concentration_sum = float(np.sum(concentrations))
-            if concentration_sum <= 0.0:
-                concentrations = [1.0 / len(blueprint.elements)] * len(blueprint.elements)
-            elif abs(concentration_sum - 1.0) > 1e-6:
-                concentrations = [value / concentration_sum for value in concentrations]
+            concentrations = self._initial_layer_concentrations(
+                blueprint.layer_index,
+                blueprint.elements,
+            )
 
             for element_index, concentration in enumerate(concentrations, start=1):
                 self.simnra.Target.SetElementConcentration(
@@ -295,11 +378,11 @@ class _SIMNRAMethodSession:
                 self.simnra.Target.SetPoreDiameter(parameter.layer_index, value)
 
         for layer_index, concentrations in layer_concentrations.items():
-            concentration_sum = float(np.sum(concentrations))
-            if concentration_sum <= 0.0:
-                raise ValueError(f"Layer {layer_index} concentration sum must be positive.")
-            if abs(concentration_sum - 1.0) > 1e-8:
-                concentrations = [value / concentration_sum for value in concentrations]
+            concentrations = self._normalize_layer_concentrations(
+                concentrations,
+                layer_index,
+                self.method_name,
+            )
             for element_index, concentration in enumerate(concentrations, start=1):
                 self.simnra.Target.SetElementConcentration(layer_index, element_index, concentration)
 
@@ -320,8 +403,15 @@ class _SIMNRAMethodSession:
 class _ThreadSessionPool:
     """Thread-local container of SIMNRA sessions, one per method."""
 
-    def __init__(self, input_spec: DatasetInputSpec):
+    def __init__(
+        self,
+        input_spec: DatasetInputSpec,
+        log_concentration_corrections: bool = False,
+        concentration_correction_threshold: float = 1e-3,
+    ):
         self.input_spec = input_spec
+        self.log_concentration_corrections = bool(log_concentration_corrections)
+        self.concentration_correction_threshold = max(0.0, float(concentration_correction_threshold))
         self._local = threading.local()
         self._created_sessions: list[dict[str, _SIMNRAMethodSession]] = []
         self._lock = threading.Lock()
@@ -329,13 +419,31 @@ class _ThreadSessionPool:
     def get_sessions(self) -> dict[str, _SIMNRAMethodSession]:
         sessions = getattr(self._local, "sessions", None)
         if sessions is None:
-            sessions = {
-                method.name: _SIMNRAMethodSession(self.input_spec, method.name)
-                for method in self.input_spec.methods
-            }
+            sessions = self._create_sessions()
             self._local.sessions = sessions
-            with self._lock:
-                self._created_sessions.append(sessions)
+        return sessions
+
+    def _create_sessions(self) -> dict[str, _SIMNRAMethodSession]:
+        sessions = {
+            method.name: _SIMNRAMethodSession(
+                self.input_spec,
+                method.name,
+                log_concentration_corrections=self.log_concentration_corrections,
+                concentration_correction_threshold=self.concentration_correction_threshold,
+            )
+            for method in self.input_spec.methods
+        }
+        with self._lock:
+            self._created_sessions.append(sessions)
+        return sessions
+
+    def reset_current_thread_sessions(self) -> dict[str, _SIMNRAMethodSession]:
+        sessions = getattr(self._local, "sessions", None)
+        if sessions is not None:
+            for session in sessions.values():
+                session.close()
+        sessions = self._create_sessions()
+        self._local.sessions = sessions
         return sessions
 
     def close_all(self) -> None:
@@ -359,10 +467,13 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         error_callback: Callable[[GenerationFailure], None] | None = None,
         progress_every: int = 10,
         print_progress: bool = True,
+        simnra_retry_limit: int = 2,
+        allow_failed_samples: bool = True,
+        log_concentration_corrections: bool = False,
+        concentration_correction_threshold: float = 1e-3,
     ):
         self.input_spec = input_spec
         self.max_workers = max(1, int(max_workers))
-        self._session_pool = _ThreadSessionPool(input_spec)
         self._open_parameters = list(input_spec.open_parameters)
         self._fixed_parameter_values = {
             parameter.name: float(parameter.fixed_value)
@@ -372,6 +483,16 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         self.error_callback = error_callback
         self.progress_every = max(1, int(progress_every))
         self.print_progress = print_progress
+        self.simnra_retry_limit = max(0, int(simnra_retry_limit))
+        self.allow_failed_samples = bool(allow_failed_samples)
+        self.log_concentration_corrections = bool(log_concentration_corrections)
+        self.concentration_correction_threshold = max(0.0, float(concentration_correction_threshold))
+        self._warning_lock = threading.Lock()
+        self._session_pool = _ThreadSessionPool(
+            input_spec,
+            log_concentration_corrections=self.log_concentration_corrections,
+            concentration_correction_threshold=self.concentration_correction_threshold,
+        )
 
     def generate(
         self,
@@ -513,11 +634,62 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
             values[parameter.name] = float(value)
         return values
 
+    def _is_retryable_simnra_error(self, exc: BaseException) -> bool:
+        message = str(exc).lower()
+        error_type = type(exc).__name__.lower()
+        return any(
+            token in message or token == error_type
+            for token in (
+                "com_error",
+                "ole",
+                "dispatch",
+                "rpc",
+                "marshalling",
+                "marshal",
+                "call was rejected",
+                "server threw an exception",
+                "server is unavailable",
+                "rpc server is unavailable",
+                "the object invoked has disconnected",
+                "catastrophic failure",
+            )
+        )
+
+    def _generate_method_spectrum_with_retries(
+        self,
+        method_name: str,
+        full_parameter_values: Mapping[str, float],
+    ) -> np.ndarray:
+        attempts = self.simnra_retry_limit + 1
+        last_exc: BaseException | None = None
+        for attempt in range(attempts):
+            sessions = self._session_pool.get_sessions()
+            try:
+                return sessions[method_name].generate_spectrum(full_parameter_values)
+            except Exception as exc:
+                last_exc = exc
+                should_retry = attempt + 1 < attempts and self._is_retryable_simnra_error(exc)
+                if not should_retry:
+                    raise
+                self._emit_retry_message(
+                    "[simnra] Recreating thread-local SIMNRA sessions after retryable failure "
+                    f"for method '{method_name}' (attempt {attempt + 1}/{attempts}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._session_pool.reset_current_thread_sessions()
+                time.sleep(min(0.05 * (attempt + 1), 0.2))
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"SIMNRA generation failed for method '{method_name}'.")
+
     def _simulate_one(self, open_vector: np.ndarray) -> dict[str, np.ndarray]:
-        sessions = self._session_pool.get_sessions()
         full_parameter_values = self._build_full_parameter_values(open_vector)
         return {
-            method.name: sessions[method.name].generate_spectrum(full_parameter_values)
+            method.name: self._generate_method_spectrum_with_retries(
+                method.name,
+                full_parameter_values,
+            )
             for method in self.input_spec.methods
         }
 
@@ -584,6 +756,16 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                 chunk_index=chunk_index,
             )
         )
+
+    def _emit_warning(self, message: str) -> None:
+        if not self.log_concentration_corrections:
+            return
+        with self._warning_lock:
+            print(f"[warning] {message}")
+
+    def _emit_retry_message(self, message: str) -> None:
+        with self._warning_lock:
+            print(message)
 
     def _generate_spectra_matrices(
         self,
@@ -656,7 +838,7 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                     ),
                 )
 
-        if failures:
+        if failures and not self.allow_failed_samples:
             details = "; ".join(
                 f"sample {failure.sample_index}: {failure.error_type}: {failure.message}"
                 for failure in failures[:5]
@@ -668,12 +850,22 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         spectra: dict[str, np.ndarray] = {}
         spectra_lengths: dict[str, np.ndarray] = {}
         for method in self.input_spec.methods:
-            rows = [result[method.name] for result in result_slots if result is not None]
-            lengths = np.asarray([row.shape[0] for row in rows], dtype=np.int32)
-            max_length = int(lengths.max())
-            padded = np.zeros((len(rows), max_length), dtype=np.float32)
-            for index, row in enumerate(rows):
-                padded[index, : row.shape[0]] = row
+            method_rows = [
+                result[method.name] if result is not None else None
+                for result in result_slots
+            ]
+            lengths = np.asarray(
+                [
+                    row.shape[0] if row is not None else 0
+                    for row in method_rows
+                ],
+                dtype=np.int32,
+            )
+            max_length = int(lengths.max()) if lengths.size else 0
+            padded = np.zeros((sample_count, max_length), dtype=np.float32)
+            for index, row in enumerate(method_rows):
+                if row is not None:
+                    padded[index, : row.shape[0]] = row
             spectra[method.name] = padded
             spectra_lengths[method.name] = lengths
         return spectra, spectra_lengths
