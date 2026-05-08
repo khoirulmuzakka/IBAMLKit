@@ -116,18 +116,20 @@ def build_setup_parameters() -> list[ParameterSpec]:
             group="setup",
             kind="calibration_linear",
             method="NRA",
-            is_open=True,
+            is_open=False,
             lower_bound=7.1725,
             upper_bound=7.9275,
+            fixed_value=7.55,
         ),
         ParameterSpec(
             name="Calib_Linear_RBS",
             group="setup",
             kind="calibration_linear",
             method="RBS",
-            is_open=True,
+            is_open=False,
             lower_bound=2.50528,
             upper_bound=2.769,
+            fixed_value=2.637,
         ),
         ParameterSpec(
             name="Calib_Offset_NRA",
@@ -144,9 +146,10 @@ def build_setup_parameters() -> list[ParameterSpec]:
             group="setup",
             kind="calibration_offset",
             method="RBS",
-            is_open=True,
+            is_open=False,
             lower_bound=-20.0,
             upper_bound=20.0,
+            fixed_value=0.0,
         ),
         ParameterSpec(
             name="Calib_Quadratic_NRA",
@@ -193,18 +196,20 @@ def build_setup_parameters() -> list[ParameterSpec]:
             group="setup",
             kind="particles_sr",
             method="NRA",
-            is_open=True,
+            is_open=False,
             lower_bound=0.0,
-            upper_bound=908000000000.0,
+            upper_bound=1e+17,
+            fixed_value=1e+15,
         ),
         ParameterSpec(
             name="ParticlesSr_RBS",
             group="setup",
             kind="particles_sr",
             method="RBS",
-            is_open=True,
+            is_open=False,
             lower_bound=0.0,
-            upper_bound=84049100000.0,
+            upper_bound=1e+17,
+            fixed_value=1e+15,
         ),
     ]
 
@@ -384,10 +389,10 @@ def build_layer_sampling_config(
 
 
 def main() -> None:
-    max_layers = 10
-    n_samples_per_case = [100 for _ in range(max_layers)]
-    n_threads = 8
-    progress_every = 100
+    max_layers = 5
+    n_samples_per_case = [3000 for _ in range(max_layers)]
+    n_threads = 4
+    progress_every = 200
     thickness_growth_ratio = 1.6
     total_thickness_min_sum = 5.0e4
     total_thickness_max_sum = 7.0e5

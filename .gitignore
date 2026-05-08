@@ -24,3 +24,4 @@ dist/
 *.egg-info/
 ibamlkit/IBADL
 IBADL
+examples/datasets/*
