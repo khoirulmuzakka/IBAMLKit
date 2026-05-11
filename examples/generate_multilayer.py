@@ -390,13 +390,14 @@ def build_layer_sampling_config(
 
 def main() -> None:
     max_layers = 10
+    base_seed = 1
     n_samples_per_case = [100000 for _ in range(max_layers)]
     n_threads = 90
     progress_every = 10000
     thickness_growth_ratio = 1.6
     total_thickness_min_sum = 5.0e4
     total_thickness_max_sum = 7.0e5
-    output_root = Path("datasets/multilayer_14_elements")
+    output_root = Path(f"datasets/multilayer_14_elements_seed_{base_seed}")
     default_layer_sampling = LayerConcentrationSamplingConfig(
         anchor_fraction=0.05,
         pure_weight=0.15,
@@ -426,6 +427,7 @@ def main() -> None:
         raise ValueError("n_samples_per_case must define one entry for each layer-count case.")
 
     for n_layers in range(1, max_layers + 1):
+        case_seed = base_seed + n_layers
         case_sample_count = int(n_samples_per_case[n_layers - 1])
         upper_bounds = thickness_upper_bounds(
             n_layers=n_layers,
@@ -442,11 +444,11 @@ def main() -> None:
             thickness_upper_bounds_per_layer=upper_bounds,
         )
 
-        rng = np.random.default_rng(n_layers)
+        rng = np.random.default_rng(case_seed)
         sampled = sample_open_parameter_matrix(
             input_spec,
             n_samples=case_sample_count,
-            seed=n_layers,
+            seed=case_seed,
             layer_sampling=build_layer_sampling_config(
                 n_layers=n_layers,
                 default_config=default_layer_sampling,
@@ -481,7 +483,10 @@ def main() -> None:
             chunk_size=case_sample_count,
             sample_ids=[f"layers-{n_layers:02d}-{index:06d}" for index in range(case_sample_count)],
         )
-        print(f"{n_layers} layer(s): wrote {len(written)} file(s) to {output_dir}")
+        print(
+            f"{n_layers} layer(s): wrote {len(written)} file(s) to {output_dir} "
+            f"(case_seed={case_seed})"
+        )
 
 
 if __name__ == "__main__":
