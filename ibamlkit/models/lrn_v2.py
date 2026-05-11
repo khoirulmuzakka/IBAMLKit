@@ -95,6 +95,67 @@ class _LayerwiseGRUBlock(nn.Module):
         return contribution, next_hidden
 
 
+class _LocalSpectrumRefiner(nn.Module):
+    """Inject local channel structure through a lightweight conv residual head."""
+
+    def __init__(
+        self,
+        *,
+        output_size: int,
+        setup_dim: int,
+        hidden_channels: int,
+        kernel_size: int,
+    ) -> None:
+        super().__init__()
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1.")
+        if hidden_channels < 1:
+            raise ValueError("hidden_channels must be >= 1.")
+
+        self.output_size = int(output_size)
+        self.hidden_channels = int(hidden_channels)
+        self.kernel_size = int(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
+        self.padding = self.kernel_size // 2
+        self._use_dummy_setup = setup_dim <= 0
+        effective_setup_dim = 1 if self._use_dummy_setup else setup_dim
+
+        self.in_projection = nn.Conv1d(1, hidden_channels, kernel_size=self.kernel_size, padding=self.padding)
+        self.residual_conv = nn.Conv1d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+        )
+        self.out_projection = nn.Conv1d(hidden_channels, 1, kernel_size=1)
+        self.setup_to_film = nn.Sequential(
+            nn.Linear(effective_setup_dim, hidden_channels * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_channels * 2, hidden_channels * 2),
+        )
+
+    def forward(self, spectra: torch.Tensor, setup_inputs: torch.Tensor) -> torch.Tensor:
+        if self._use_dummy_setup:
+            setup_inputs = torch.ones(
+                (spectra.shape[0], 1),
+                device=spectra.device,
+                dtype=spectra.dtype,
+            )
+
+        features = self.in_projection(spectra.unsqueeze(1))
+        gamma, beta = torch.chunk(
+            self.setup_to_film(setup_inputs.to(device=spectra.device, dtype=spectra.dtype)),
+            2,
+            dim=1,
+        )
+        gamma = torch.tanh(gamma).unsqueeze(-1) + 1.0
+        beta = beta.unsqueeze(-1)
+        features = F.leaky_relu(features * gamma + beta)
+        residual = self.residual_conv(features)
+        residual = F.leaky_relu(residual + features)
+        residual = self.out_projection(residual).squeeze(1)
+        return spectra + residual
+
+
 class LRNModelV2(ForwardModelBase):
     """Layerwise recurrent network with latent accumulation and shared decoder.
 
@@ -114,6 +175,8 @@ class LRNModelV2(ForwardModelBase):
         layer_embedding_dim: int = 256,
         block_hidden_sizes: Sequence[int] = (512, 512),
         decoder_hidden_sizes: Sequence[int] = (1024, 1024),
+        refiner_hidden_channels: int = 32,
+        refiner_kernel_size: int = 17,
     ) -> None:
         super().__init__(schema)
         layout = LRNModel._infer_input_layout(schema)
@@ -157,6 +220,12 @@ class LRNModelV2(ForwardModelBase):
             prev = width
         decoder_layers.append(nn.Linear(prev, self.output_size))
         self.spectrum_decoder = nn.Sequential(*decoder_layers)
+        self.spectrum_refiner = _LocalSpectrumRefiner(
+            output_size=self.output_size,
+            setup_dim=self.setup_param_size,
+            hidden_channels=refiner_hidden_channels,
+            kernel_size=refiner_kernel_size,
+        )
         self.output_scale = nn.Parameter(torch.ones(self.output_size), requires_grad=True)
 
     def normalize_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -233,7 +302,9 @@ class LRNModelV2(ForwardModelBase):
 
         decoder_input = torch.cat((contribution_total, hidden_state, setup_context), dim=1)
         logits = self.spectrum_decoder(decoder_input)
-        return F.softplus(logits) * F.softplus(self.output_scale).to(
+        coarse_spectrum = F.softplus(logits)
+        refined_spectrum = F.softplus(self.spectrum_refiner(coarse_spectrum, setup_inputs))
+        return refined_spectrum * F.softplus(self.output_scale).to(
             device=logits.device,
             dtype=logits.dtype,
         )

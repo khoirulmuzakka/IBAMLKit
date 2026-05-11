@@ -56,12 +56,12 @@ def build_methods() -> list[MethodSpec]:
     return [
         MethodSpec(
             name="NRA",
-            reference_file="D:/IBAMLKit/xnra/Ref_all_nra_nopu.xnra",
+            reference_file="D:/IBAMLKit/xnra/Ref_all_nra_nopu_703.xnra",
             file_type="SIMNRA",
         ),
         MethodSpec(
             name="RBS",
-            reference_file="D:/IBAMLKit/xnra/Ref_all_rbs_nopu.xnra",
+            reference_file="D:/IBAMLKit/xnra/Ref_all_rbs_nopu_703.xnra",
             file_type="SIMNRA",
         ),
     ]
@@ -390,8 +390,8 @@ def build_layer_sampling_config(
 
 def main() -> None:
     max_layers = 10
-    n_samples_per_case = [150000 for _ in range(max_layers)]
-    n_threads = 64
+    n_samples_per_case = [100000 for _ in range(max_layers)]
+    n_threads = 90
     progress_every = 10000
     thickness_growth_ratio = 1.6
     total_thickness_min_sum = 5.0e4

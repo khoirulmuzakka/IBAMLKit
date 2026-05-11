@@ -2,7 +2,7 @@
 
 from .base import ModelTrainer, TrainingBatch, TrainingResult
 from .datasets import PreparedSurrogateDataset, prepare_variable_layer_surrogate_dataset
-from .losses import Chi2Loss, Log1pMSELoss
+from .losses import Chi2Loss, Log1pMSELoss, PeakAwareLoss
 from .preprocessing import (
     ArrayTransform,
     BinMerger,
@@ -30,6 +30,7 @@ __all__ = [
     "Log1pMSELoss",
     "MinMaxScaler",
     "ModelTrainer",
+    "PeakAwareLoss",
     "PreparedSurrogateDataset",
     "ROISelector",
     "SpectrumPreprocessor",
