@@ -25,3 +25,6 @@ dist/
 ibamlkit/IBADL
 IBADL
 examples/datasets/*
+ibamlkit/pileup/lib/ 
+modules/Pileup++/bin/
+modules/Pileup++/build/

@@ -463,6 +463,7 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         self,
         input_spec: DatasetInputSpec,
         max_workers: int = 1,
+        keep_alive: bool = False,
         progress_callback: Callable[[GenerationProgress], None] | None = None,
         error_callback: Callable[[GenerationFailure], None] | None = None,
         progress_every: int = 10,
@@ -474,6 +475,7 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
     ):
         self.input_spec = input_spec
         self.max_workers = max(1, int(max_workers))
+        self.keep_alive = bool(keep_alive)
         self._open_parameters = list(input_spec.open_parameters)
         self._fixed_parameter_values = {
             parameter.name: float(parameter.fixed_value)
@@ -493,6 +495,31 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
             log_concentration_corrections=self.log_concentration_corrections,
             concentration_correction_threshold=self.concentration_correction_threshold,
         )
+        self._persistent_executor: ThreadPoolExecutor | None = None
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        executor = self._persistent_executor
+        self._persistent_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self._session_pool.close_all()
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_executor(self) -> tuple[ThreadPoolExecutor, bool]:
+        if not self.keep_alive:
+            return ThreadPoolExecutor(max_workers=self.max_workers), True
+        if self._persistent_executor is None:
+            self._persistent_executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        return self._persistent_executor, False
 
     def generate(
         self,
@@ -500,7 +527,9 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         sample_ids: Sequence[str] | None = None,
     ) -> IBADataset:
         started_at = time.time()
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        if self._closed:
+            raise RuntimeError("SIMNRASpectrumGenerator has been closed.")
+        executor, owns_executor = self._get_executor()
         try:
             open_values = self._validate_open_parameter_values(open_parameter_values)
             resolved_sample_ids = self._resolve_sample_ids(open_values.shape[0], sample_ids)
@@ -524,8 +553,10 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                 sample_ids=resolved_sample_ids,
             )
         finally:
-            executor.shutdown(wait=True)
-            self._session_pool.close_all()
+            if owns_executor:
+                executor.shutdown(wait=True)
+            if not self.keep_alive:
+                self._session_pool.close_all()
 
     def generate_to_files(
         self,
@@ -536,7 +567,9 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         sample_ids: Sequence[str] | None = None,
     ) -> list[str]:
         started_at = time.time()
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        if self._closed:
+            raise RuntimeError("SIMNRASpectrumGenerator has been closed.")
+        executor, owns_executor = self._get_executor()
         try:
             open_values = self._validate_open_parameter_values(open_parameter_values)
             resolved_sample_ids = self._resolve_sample_ids(open_values.shape[0], sample_ids)
@@ -601,8 +634,10 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
 
             return file_paths
         finally:
-            executor.shutdown(wait=True)
-            self._session_pool.close_all()
+            if owns_executor:
+                executor.shutdown(wait=True)
+            if not self.keep_alive:
+                self._session_pool.close_all()
 
     def _validate_open_parameter_values(self, open_parameter_values: np.ndarray) -> np.ndarray:
         open_values = np.asarray(open_parameter_values, dtype=np.float32)
