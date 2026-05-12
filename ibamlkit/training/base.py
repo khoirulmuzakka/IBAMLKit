@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 import torch
 
-from ibamlkit.models import ForwardModelBase
+from ibamlkit.models.forward import ForwardModelBase
 
 
 @dataclass(frozen=True)

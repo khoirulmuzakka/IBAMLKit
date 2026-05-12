@@ -1,5 +1,4 @@
-"""LRN surrogate model implementation."""
-
+"""An LRN variant with latent contribution accumulation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +8,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ibamlkit.models.base import ForwardModelBase
+
+from .base import ForwardModelBase
+from .base import ForwardModelBase
 from ibamlkit.schema import (
     DatasetInputSpec,
     ModelInputSpec,
@@ -133,22 +134,20 @@ def build_lrn_model_schema(
     )
 
 
-class _LRNLayerBlock(nn.Module):
+class _LayerwiseGRUBlock(nn.Module):
+    """One recurrent layer block for context-aware per-layer processing."""
+
     def __init__(
         self,
-        hidden_size: int,
+        *,
         layer_param_size: int,
         setup_param_size: int,
-        output_size: int,
-        hidden_nodes: Sequence[int],
+        hidden_size: int,
+        contribution_size: int,
         embedding_dim: int,
+        block_hidden_sizes: Sequence[int],
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.embedding_dim = embedding_dim
-        self.max_exp = 9.0
-
         self._use_dummy_layer = layer_param_size <= 0
         self._use_dummy_setup = setup_param_size <= 0
         layer_in_features = 1 if self._use_dummy_layer else layer_param_size
@@ -172,15 +171,19 @@ class _LRNLayerBlock(nn.Module):
             nn.LeakyReLU(),
         )
 
-        core_layers: list[nn.Module] = []
+        fused_layers: list[nn.Module] = []
         prev = embedding_dim * 3
-        for width in hidden_nodes:
-            core_layers.append(nn.Linear(prev, width))
-            core_layers.append(nn.LeakyReLU())
+        for width in block_hidden_sizes:
+            fused_layers.append(nn.Linear(prev, width))
+            fused_layers.append(nn.LeakyReLU())
             prev = width
-        self.core = nn.Sequential(*core_layers) if core_layers else nn.Identity()
-        self.output_head = nn.Linear(prev, output_size)
-        self.hidden_head = nn.Linear(prev, hidden_size)
+        self.fused_tower = nn.Sequential(*fused_layers) if fused_layers else nn.Identity()
+        self.gru_cell = nn.GRUCell(prev, hidden_size)
+        self.contribution_head = nn.Sequential(
+            nn.Linear(prev + hidden_size, max(contribution_size, embedding_dim)),
+            nn.LeakyReLU(),
+            nn.Linear(max(contribution_size, embedding_dim), contribution_size),
+        )
 
     def forward(
         self,
@@ -207,79 +210,94 @@ class _LRNLayerBlock(nn.Module):
         gamma = torch.tanh(gamma) + 1.0
         conditioned_layer = layer_feat * gamma + beta
         hidden_feat = self.hidden_projection(hidden_state)
-        fused = self.core(torch.cat((conditioned_layer, setup_feat, hidden_feat), dim=1))
-        logits = self.output_head(fused)
-        next_hidden = hidden_state + self.hidden_head(fused)
-        return torch.exp(torch.clamp(logits, max=self.max_exp)) - 1.0, next_hidden
+        fused = self.fused_tower(torch.cat((conditioned_layer, setup_feat, hidden_feat), dim=1))
+        next_hidden = self.gru_cell(fused, hidden_state)
+        contribution = self.contribution_head(torch.cat((fused, next_hidden), dim=1))
+        return contribution, next_hidden
 
 
-class _LearnableKernelRefiner(nn.Module):
+class _LocalSpectrumRefiner(nn.Module):
+    """Inject local channel structure through a lightweight conv residual head."""
+
     def __init__(
         self,
+        *,
+        output_size: int,
         setup_dim: int,
-        kernel_size: int = 65,
-        kernel_hidden: int = 128,
-        padding_mode: str = "replicate",
+        hidden_channels: int,
+        kernel_size: int,
     ) -> None:
         super().__init__()
-        self.kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-        self.pad = self.kernel_size // 2
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1.")
+        if hidden_channels < 1:
+            raise ValueError("hidden_channels must be >= 1.")
+
+        self.output_size = int(output_size)
+        self.hidden_channels = int(hidden_channels)
+        self.kernel_size = int(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
+        self.padding = self.kernel_size // 2
         self._use_dummy_setup = setup_dim <= 0
-        effective_in = 1 if self._use_dummy_setup else setup_dim
+        effective_setup_dim = 1 if self._use_dummy_setup else setup_dim
 
-        self.kernel_generator = nn.Sequential(
-            nn.Linear(effective_in, kernel_hidden),
-            nn.LeakyReLU(),
-            nn.Linear(kernel_hidden, kernel_hidden),
-            nn.LeakyReLU(),
-            nn.Linear(kernel_hidden, self.kernel_size),
+        self.in_projection = nn.Conv1d(1, hidden_channels, kernel_size=self.kernel_size, padding=self.padding)
+        self.residual_conv = nn.Conv1d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
         )
-        self.kernel_bias = nn.Parameter(torch.zeros(self.kernel_size))
-
-        if padding_mode == "constant":
-            self.pad_layer = nn.ConstantPad1d((self.pad, self.pad), 0.0)
-        elif padding_mode == "replicate":
-            self.pad_layer = nn.ReplicationPad1d(self.pad)
-        else:
-            raise ValueError(f"Unsupported padding_mode: {padding_mode}")
-
-        extractor = torch.zeros(self.kernel_size, 1, self.kernel_size, dtype=torch.float32)
-        for index in range(self.kernel_size):
-            extractor[index, 0, index] = 1.0
-        self.register_buffer("extractor", extractor)
-
-    def _kernel(self, setup_inputs: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self._use_dummy_setup:
-            setup_inputs = torch.ones((setup_inputs.shape[0], 1), device=device, dtype=dtype)
-        else:
-            setup_inputs = setup_inputs.to(device=device, dtype=dtype)
-
-        kernel = self.kernel_generator(setup_inputs) + self.kernel_bias.to(device=device, dtype=dtype)
-        kernel = F.softplus(kernel)
-        kernel = kernel / (kernel.sum(dim=-1, keepdim=True) + 1e-12)
-        return kernel
+        self.out_projection = nn.Conv1d(hidden_channels, 1, kernel_size=1)
+        self.setup_to_film = nn.Sequential(
+            nn.Linear(effective_setup_dim, hidden_channels * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_channels * 2, hidden_channels * 2),
+        )
 
     def forward(self, spectra: torch.Tensor, setup_inputs: torch.Tensor) -> torch.Tensor:
-        original_is_2d = spectra.dim() == 2
-        spectra = spectra.reshape(spectra.size(0), 1, -1)
-        padded = self.pad_layer(spectra)
-        windows = F.conv1d(padded, self.extractor, padding=0).permute(0, 2, 1)
-        kernels = self._kernel(setup_inputs, spectra.device, spectra.dtype)
-        refined = (windows * kernels.unsqueeze(1)).sum(dim=-1).unsqueeze(1)
-        return refined.squeeze(1) if original_is_2d else refined
+        if self._use_dummy_setup:
+            setup_inputs = torch.ones(
+                (spectra.shape[0], 1),
+                device=spectra.device,
+                dtype=spectra.dtype,
+            )
+
+        features = self.in_projection(spectra.unsqueeze(1))
+        gamma, beta = torch.chunk(
+            self.setup_to_film(setup_inputs.to(device=spectra.device, dtype=spectra.dtype)),
+            2,
+            dim=1,
+        )
+        gamma = torch.tanh(gamma).unsqueeze(-1) + 1.0
+        beta = beta.unsqueeze(-1)
+        features = F.leaky_relu(features * gamma + beta)
+        residual = self.residual_conv(features)
+        residual = F.leaky_relu(residual + features)
+        residual = self.out_projection(residual).squeeze(1)
+        return spectra + residual
 
 
 class LRNModel(ForwardModelBase):
-    """Layerwise recurrent network surrogate model."""
+    """Layerwise recurrent network with latent accumulation and shared decoder.
+
+    Unlike :class:`LRNModel`, this variant does not force each layer step to
+    predict a full spectrum. Each step emits a compact latent contribution,
+    contributions are accumulated across the layer sequence, and a single shared
+    decoder maps the accumulated representation to the final spectrum.
+    """
 
     def __init__(
         self,
         schema: ModelSchema,
         *,
         hidden_size: int = 256,
-        hidden_nodes: Sequence[int] = (512, 1024),
+        contribution_size: int = 256,
+        setup_embedding_dim: int = 128,
         layer_embedding_dim: int = 256,
-        kernel_size: int = 65,
+        block_hidden_sizes: Sequence[int] = (512, 512),
+        decoder_hidden_sizes: Sequence[int] = (1024, 1024),
+        refiner_hidden_channels: int = 32,
+        refiner_kernel_size: int = 17,
     ) -> None:
         super().__init__(schema)
         layout = self._infer_input_layout(schema)
@@ -289,12 +307,10 @@ class LRNModel(ForwardModelBase):
         self.layer_count = layout.layer_count
         self.output_size = self._infer_output_size(schema)
         self.hidden_size = hidden_size
-        self.hidden_nodes = tuple(hidden_nodes)
+        self.contribution_size = contribution_size
+        self.setup_embedding_dim = setup_embedding_dim
         self.layer_embedding_dim = layer_embedding_dim
-        self.setup_feature_indices = torch.tensor(
-            layout.setup_feature_indices,
-            dtype=torch.int64,
-        )
+        self.setup_feature_indices = torch.tensor(layout.setup_feature_indices, dtype=torch.int64)
         self.layer_feature_indices = tuple(
             torch.tensor(indices, dtype=torch.int64)
             for indices in layout.layer_feature_indices
@@ -302,21 +318,118 @@ class LRNModel(ForwardModelBase):
         self.concentration_indices = [list(offsets) for offsets in layout.concentration_feature_offsets]
         self.layer_feature_names = layout.layer_feature_names
 
-        self.layer_block = _LRNLayerBlock(
-            hidden_size=hidden_size,
+        self.setup_context_encoder = nn.Sequential(
+            nn.Linear(max(self.setup_param_size, 1), setup_embedding_dim),
+            nn.LeakyReLU(),
+            nn.Linear(setup_embedding_dim, setup_embedding_dim),
+            nn.LeakyReLU(),
+        )
+        self.layer_block = _LayerwiseGRUBlock(
             layer_param_size=self.layer_param_size,
             setup_param_size=self.setup_param_size,
-            output_size=self.output_size,
-            hidden_nodes=self.hidden_nodes,
+            hidden_size=hidden_size,
+            contribution_size=contribution_size,
             embedding_dim=layer_embedding_dim,
+            block_hidden_sizes=block_hidden_sizes,
         )
-        self.refiner = _LearnableKernelRefiner(
-            setup_dim=self.setup_param_size,
-            kernel_size=kernel_size,
-            kernel_hidden=layer_embedding_dim,
-        )
-        self.norm_param = nn.Parameter(torch.ones(self.output_size), requires_grad=True)
 
+        decoder_layers: list[nn.Module] = []
+        prev = contribution_size + hidden_size + setup_embedding_dim
+        for width in decoder_hidden_sizes:
+            decoder_layers.append(nn.Linear(prev, width))
+            decoder_layers.append(nn.LeakyReLU())
+            prev = width
+        decoder_layers.append(nn.Linear(prev, self.output_size))
+        self.spectrum_decoder = nn.Sequential(*decoder_layers)
+        self.spectrum_refiner = _LocalSpectrumRefiner(
+            output_size=self.output_size,
+            setup_dim=self.setup_param_size,
+            hidden_channels=refiner_hidden_channels,
+            kernel_size=refiner_kernel_size,
+        )
+        self.output_scale = nn.Parameter(torch.ones(self.output_size), requires_grad=True)
+
+    def normalize_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
+        if not self.concentration_indices or self.layer_param_size <= 0:
+            return inputs
+
+        normalized = inputs.clone()
+        for layer_index, concentration_indices in enumerate(self.concentration_indices):
+            if not concentration_indices:
+                continue
+            current = normalized.index_select(
+                dim=1,
+                index=self.layer_feature_indices[layer_index].to(device=inputs.device),
+            )
+            concentrations = current[:, concentration_indices].clamp_min(0.0)
+            sums = concentrations.sum(dim=1, keepdim=True)
+            concentrations = concentrations / torch.where(
+                sums > 0.0,
+                sums,
+                torch.ones_like(sums),
+            )
+            current[:, concentration_indices] = concentrations
+            normalized[:, self.layer_feature_indices[layer_index].to(device=inputs.device)] = current
+        return normalized
+
+    def split_inputs(self, inputs: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.setup_param_size > 0:
+            setup = inputs.index_select(
+                dim=1,
+                index=self.setup_feature_indices.to(device=inputs.device),
+            )
+        else:
+            setup = inputs.new_zeros((inputs.shape[0], 0))
+        layers = [
+            inputs.index_select(dim=1, index=indices.to(device=inputs.device))
+            for indices in self.layer_feature_indices
+        ]
+        return setup, layers
+
+    def _encode_setup_context(self, setup_inputs: torch.Tensor) -> torch.Tensor:
+        if self.setup_param_size <= 0:
+            setup_inputs = torch.ones(
+                (setup_inputs.shape[0], 1),
+                device=setup_inputs.device,
+                dtype=setup_inputs.dtype,
+            )
+        return self.setup_context_encoder(setup_inputs)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        self.validate_input_shape(inputs)
+        inputs = self.normalize_inputs(inputs)
+        setup_inputs, layer_inputs = self.split_inputs(inputs)
+
+        batch_size = inputs.shape[0]
+        hidden_state = torch.zeros(
+            (batch_size, self.hidden_size),
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
+        contribution_total = torch.zeros(
+            (batch_size, self.contribution_size),
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
+        setup_context = self._encode_setup_context(setup_inputs)
+
+        for current_layer in layer_inputs:
+            mask = (~(current_layer == 0).all(dim=1)).float().unsqueeze(1)
+            if mask.sum() == 0:
+                break
+            contribution, next_hidden = self.layer_block(current_layer, setup_inputs, hidden_state)
+            contribution_total = contribution_total + contribution * mask
+            hidden_state = hidden_state * (1.0 - mask) + next_hidden * mask
+
+        decoder_input = torch.cat((contribution_total, hidden_state, setup_context), dim=1)
+        logits = self.spectrum_decoder(decoder_input)
+        coarse_spectrum = F.softplus(logits)
+        refined_spectrum = F.softplus(self.spectrum_refiner(coarse_spectrum, setup_inputs))
+        return refined_spectrum * F.softplus(self.output_scale).to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+    
     @staticmethod
     def _infer_output_size(schema: ModelSchema) -> int:
         if schema.outputs.spectra_lengths:
@@ -388,60 +501,3 @@ class LRNModel(ForwardModelBase):
             concentration_feature_offsets=tuple(concentration_feature_offsets),
             layer_feature_names=tuple(feature.name for feature in template_features),
         )
-
-    def normalize_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.concentration_indices or self.layer_param_size <= 0:
-            return inputs
-
-        normalized = inputs.clone()
-        for layer_index, concentration_indices in enumerate(self.concentration_indices):
-            if not concentration_indices:
-                continue
-            current = normalized.index_select(
-                dim=1,
-                index=self.layer_feature_indices[layer_index].to(device=inputs.device),
-            )
-            concentrations = current[:, concentration_indices].clamp_min(0.0)
-            sums = concentrations.sum(dim=1, keepdim=True)
-            concentrations = concentrations / torch.where(
-                sums > 0.0,
-                sums,
-                torch.ones_like(sums),
-            )
-            current[:, concentration_indices] = concentrations
-            normalized[:, self.layer_feature_indices[layer_index].to(device=inputs.device)] = current
-        return normalized
-
-    def split_inputs(self, inputs: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        if self.setup_param_size > 0:
-            setup = inputs.index_select(
-                dim=1,
-                index=self.setup_feature_indices.to(device=inputs.device),
-            )
-        else:
-            setup = inputs.new_zeros((inputs.shape[0], 0))
-        layers = [
-            inputs.index_select(dim=1, index=indices.to(device=inputs.device))
-            for indices in self.layer_feature_indices
-        ]
-        return setup, layers
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        self.validate_input_shape(inputs)
-        inputs = self.normalize_inputs(inputs)
-        setup_inputs, layer_inputs = self.split_inputs(inputs)
-
-        batch_size = inputs.shape[0]
-        hidden_state = torch.ones((batch_size, self.hidden_size), device=inputs.device, dtype=inputs.dtype)
-        spectra = torch.zeros((batch_size, self.output_size), device=inputs.device, dtype=inputs.dtype)
-
-        for current_layer in layer_inputs:
-            mask = (~(current_layer == 0).all(dim=1)).float().unsqueeze(1)
-            if mask.sum() == 0:
-                break
-            partial_spectrum, next_hidden = self.layer_block(current_layer, setup_inputs, hidden_state)
-            spectra = spectra + partial_spectrum * mask
-            hidden_state = hidden_state * (1.0 - mask) + next_hidden * mask
-
-        spectra = self.refiner(spectra.unsqueeze(1), setup_inputs).squeeze(1)
-        return spectra * F.softplus(self.norm_param).to(device=spectra.device, dtype=spectra.dtype)

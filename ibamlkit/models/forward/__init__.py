@@ -1,14 +1,12 @@
 """Public model runtime APIs."""
 
 from .base import ForwardModelBase
-from .TransformerSurrogateModel import TransformerSurrogateModel
+from .ltn import LTNModel
 from .lrn import LRNModel, build_lrn_model_schema
-from .lrn_v2 import LRNModelV2
 
 __all__ = [
     "ForwardModelBase",
+    "LTNModel",
     "LRNModel",
-    "LRNModelV2",
-    "TransformerSurrogateModel",
     "build_lrn_model_schema",
 ]

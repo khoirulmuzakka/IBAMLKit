@@ -1,4 +1,4 @@
-"""A second LRN variant with latent contribution accumulation."""
+"""Transformer-based surrogate forward model for layered samples."""
 
 from __future__ import annotations
 
@@ -8,100 +8,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ibamlkit.models.base import ForwardModelBase
-from ibamlkit.models.lrn import LRNModel
+from .base import ForwardModelBase
+from .lrn import LRNModel
 from ibamlkit.schema import ModelSchema
 
 
-class _LayerwiseGRUBlock(nn.Module):
-    """One recurrent layer block for context-aware per-layer processing."""
-
-    def __init__(
-        self,
-        *,
-        layer_param_size: int,
-        setup_param_size: int,
-        hidden_size: int,
-        contribution_size: int,
-        embedding_dim: int,
-        block_hidden_sizes: Sequence[int],
-    ) -> None:
-        super().__init__()
-        self._use_dummy_layer = layer_param_size <= 0
-        self._use_dummy_setup = setup_param_size <= 0
-        layer_in_features = 1 if self._use_dummy_layer else layer_param_size
-        setup_in_features = 1 if self._use_dummy_setup else setup_param_size
-
-        self.layer_encoder = nn.Sequential(
-            nn.Linear(layer_in_features, embedding_dim),
-            nn.LeakyReLU(),
-        )
-        self.setup_encoder = nn.Sequential(
-            nn.Linear(setup_in_features, embedding_dim),
-            nn.LeakyReLU(),
-        )
-        self.setup_to_film = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.LeakyReLU(),
-            nn.Linear(embedding_dim, 2 * embedding_dim),
-        )
-        self.hidden_projection = nn.Sequential(
-            nn.Linear(hidden_size, embedding_dim),
-            nn.LeakyReLU(),
-        )
-
-        fused_layers: list[nn.Module] = []
-        prev = embedding_dim * 3
-        for width in block_hidden_sizes:
-            fused_layers.append(nn.Linear(prev, width))
-            fused_layers.append(nn.LeakyReLU())
-            prev = width
-        self.fused_tower = nn.Sequential(*fused_layers) if fused_layers else nn.Identity()
-        self.gru_cell = nn.GRUCell(prev, hidden_size)
-        self.contribution_head = nn.Sequential(
-            nn.Linear(prev + hidden_size, max(contribution_size, embedding_dim)),
-            nn.LeakyReLU(),
-            nn.Linear(max(contribution_size, embedding_dim), contribution_size),
-        )
-
-    def forward(
-        self,
-        layer_inputs: torch.Tensor,
-        setup_inputs: torch.Tensor,
-        hidden_state: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._use_dummy_layer:
-            layer_inputs = torch.ones(
-                (layer_inputs.shape[0], 1),
-                device=layer_inputs.device,
-                dtype=layer_inputs.dtype,
-            )
-        if self._use_dummy_setup:
-            setup_inputs = torch.ones(
-                (setup_inputs.shape[0], 1),
-                device=setup_inputs.device,
-                dtype=setup_inputs.dtype,
-            )
-
-        layer_feat = self.layer_encoder(layer_inputs)
-        setup_feat = self.setup_encoder(setup_inputs)
-        gamma, beta = torch.chunk(self.setup_to_film(setup_feat), 2, dim=1)
-        gamma = torch.tanh(gamma) + 1.0
-        conditioned_layer = layer_feat * gamma + beta
-        hidden_feat = self.hidden_projection(hidden_state)
-        fused = self.fused_tower(torch.cat((conditioned_layer, setup_feat, hidden_feat), dim=1))
-        next_hidden = self.gru_cell(fused, hidden_state)
-        contribution = self.contribution_head(torch.cat((fused, next_hidden), dim=1))
-        return contribution, next_hidden
-
-
 class _LocalSpectrumRefiner(nn.Module):
-    """Inject local channel structure through a lightweight conv residual head."""
+    """Lightweight setup-conditioned local residual correction."""
 
     def __init__(
         self,
         *,
-        output_size: int,
         setup_dim: int,
         hidden_channels: int,
         kernel_size: int,
@@ -112,8 +29,6 @@ class _LocalSpectrumRefiner(nn.Module):
         if hidden_channels < 1:
             raise ValueError("hidden_channels must be >= 1.")
 
-        self.output_size = int(output_size)
-        self.hidden_channels = int(hidden_channels)
         self.kernel_size = int(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
         self.padding = self.kernel_size // 2
         self._use_dummy_setup = setup_dim <= 0
@@ -156,72 +71,71 @@ class _LocalSpectrumRefiner(nn.Module):
         return spectra + residual
 
 
-class LRNModelV2(ForwardModelBase):
-    """Layerwise recurrent network with latent accumulation and shared decoder.
-
-    Unlike :class:`LRNModel`, this variant does not force each layer step to
-    predict a full spectrum. Each step emits a compact latent contribution,
-    contributions are accumulated across the layer sequence, and a single shared
-    decoder maps the accumulated representation to the final spectrum.
-    """
+class LTNModel(ForwardModelBase):
+    """Layerwise Transformer Network 
+    Encoder-only transformer surrogate for variable-layer samples."""
 
     def __init__(
         self,
         schema: ModelSchema,
         *,
-        hidden_size: int = 256,
-        contribution_size: int = 256,
-        setup_embedding_dim: int = 128,
-        layer_embedding_dim: int = 256,
-        block_hidden_sizes: Sequence[int] = (512, 512),
+        model_dim: int = 256,
+        num_heads: int = 8,
+        num_encoder_layers: int = 4,
+        feedforward_dim: int = 512,
+        dropout: float = 0.1,
         decoder_hidden_sizes: Sequence[int] = (1024, 1024),
         refiner_hidden_channels: int = 32,
         refiner_kernel_size: int = 17,
     ) -> None:
         super().__init__(schema)
+        if model_dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads.")
+
         layout = LRNModel._infer_input_layout(schema)
         self.input_layout = layout
         self.setup_param_size = layout.setup_param_size
         self.layer_param_size = layout.layer_param_size
         self.layer_count = layout.layer_count
         self.output_size = LRNModel._infer_output_size(schema)
-        self.hidden_size = hidden_size
-        self.contribution_size = contribution_size
-        self.setup_embedding_dim = setup_embedding_dim
-        self.layer_embedding_dim = layer_embedding_dim
+        self.model_dim = int(model_dim)
         self.setup_feature_indices = torch.tensor(layout.setup_feature_indices, dtype=torch.int64)
         self.layer_feature_indices = tuple(
             torch.tensor(indices, dtype=torch.int64)
             for indices in layout.layer_feature_indices
         )
         self.concentration_indices = [list(offsets) for offsets in layout.concentration_feature_offsets]
-        self.layer_feature_names = layout.layer_feature_names
 
-        self.setup_context_encoder = nn.Sequential(
-            nn.Linear(max(self.setup_param_size, 1), setup_embedding_dim),
-            nn.LeakyReLU(),
-            nn.Linear(setup_embedding_dim, setup_embedding_dim),
-            nn.LeakyReLU(),
+        self.layer_projection = nn.Linear(max(self.layer_param_size, 1), model_dim)
+        self.setup_projection = nn.Linear(max(self.setup_param_size, 1), model_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, model_dim))
+        self.position_embeddings = nn.Parameter(torch.zeros(1, self.layer_count + 1, model_dim))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_embeddings, mean=0.0, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.layer_block = _LayerwiseGRUBlock(
-            layer_param_size=self.layer_param_size,
-            setup_param_size=self.setup_param_size,
-            hidden_size=hidden_size,
-            contribution_size=contribution_size,
-            embedding_dim=layer_embedding_dim,
-            block_hidden_sizes=block_hidden_sizes,
-        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        self.encoder_norm = nn.LayerNorm(model_dim)
 
         decoder_layers: list[nn.Module] = []
-        prev = contribution_size + hidden_size + setup_embedding_dim
+        prev = model_dim * 3
         for width in decoder_hidden_sizes:
             decoder_layers.append(nn.Linear(prev, width))
-            decoder_layers.append(nn.LeakyReLU())
+            decoder_layers.append(nn.GELU())
+            if dropout > 0.0:
+                decoder_layers.append(nn.Dropout(dropout))
             prev = width
         decoder_layers.append(nn.Linear(prev, self.output_size))
         self.spectrum_decoder = nn.Sequential(*decoder_layers)
         self.spectrum_refiner = _LocalSpectrumRefiner(
-            output_size=self.output_size,
             setup_dim=self.setup_param_size,
             hidden_channels=refiner_hidden_channels,
             kernel_size=refiner_kernel_size,
@@ -265,42 +179,66 @@ class LRNModelV2(ForwardModelBase):
         ]
         return setup, layers
 
-    def _encode_setup_context(self, setup_inputs: torch.Tensor) -> torch.Tensor:
+    def _prepare_setup(self, setup_inputs: torch.Tensor) -> torch.Tensor:
         if self.setup_param_size <= 0:
-            setup_inputs = torch.ones(
+            return torch.ones(
                 (setup_inputs.shape[0], 1),
                 device=setup_inputs.device,
                 dtype=setup_inputs.dtype,
             )
-        return self.setup_context_encoder(setup_inputs)
+        return setup_inputs
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         self.validate_input_shape(inputs)
         inputs = self.normalize_inputs(inputs)
         setup_inputs, layer_inputs = self.split_inputs(inputs)
-
         batch_size = inputs.shape[0]
-        hidden_state = torch.zeros(
-            (batch_size, self.hidden_size),
+
+        setup_effective = self._prepare_setup(setup_inputs)
+        setup_token = self.setup_projection(setup_effective).unsqueeze(1)
+
+        if self.layer_count > 0:
+            layer_tensor = torch.stack(layer_inputs, dim=1)
+            layer_mask = (layer_tensor.abs().sum(dim=2) == 0.0)
+            if self.layer_param_size <= 0:
+                layer_tensor = torch.ones(
+                    (batch_size, self.layer_count, 1),
+                    device=inputs.device,
+                    dtype=inputs.dtype,
+                )
+            layer_tokens = self.layer_projection(layer_tensor)
+        else:
+            layer_mask = torch.zeros((batch_size, 0), device=inputs.device, dtype=torch.bool)
+            layer_tokens = inputs.new_zeros((batch_size, 0, self.model_dim))
+
+        cls_token = self.cls_token.to(device=inputs.device, dtype=inputs.dtype).expand(batch_size, -1, -1)
+        cls_token = cls_token + setup_token
+        tokens = torch.cat((cls_token, layer_tokens), dim=1)
+        tokens = tokens + self.position_embeddings[:, : tokens.shape[1], :].to(
             device=inputs.device,
             dtype=inputs.dtype,
         )
-        contribution_total = torch.zeros(
-            (batch_size, self.contribution_size),
-            device=inputs.device,
-            dtype=inputs.dtype,
+        key_padding_mask = torch.cat(
+            (
+                torch.zeros((batch_size, 1), device=inputs.device, dtype=torch.bool),
+                layer_mask,
+            ),
+            dim=1,
         )
-        setup_context = self._encode_setup_context(setup_inputs)
 
-        for current_layer in layer_inputs:
-            mask = (~(current_layer == 0).all(dim=1)).float().unsqueeze(1)
-            if mask.sum() == 0:
-                break
-            contribution, next_hidden = self.layer_block(current_layer, setup_inputs, hidden_state)
-            contribution_total = contribution_total + contribution * mask
-            hidden_state = hidden_state * (1.0 - mask) + next_hidden * mask
+        encoded = self.encoder(tokens, src_key_padding_mask=key_padding_mask)
+        encoded = self.encoder_norm(encoded)
+        cls_summary = encoded[:, 0, :]
+        if layer_tokens.shape[1] > 0:
+            valid_layers = (~layer_mask).unsqueeze(-1)
+            layer_summary = (encoded[:, 1:, :] * valid_layers).sum(dim=1) / valid_layers.sum(dim=1).clamp_min(1)
+            layer_max = encoded[:, 1:, :].masked_fill(layer_mask.unsqueeze(-1), float("-inf")).amax(dim=1)
+            layer_max = torch.where(torch.isfinite(layer_max), layer_max, torch.zeros_like(layer_max))
+        else:
+            layer_summary = torch.zeros_like(cls_summary)
+            layer_max = torch.zeros_like(cls_summary)
 
-        decoder_input = torch.cat((contribution_total, hidden_state, setup_context), dim=1)
+        decoder_input = torch.cat((cls_summary, layer_summary, layer_max), dim=1)
         logits = self.spectrum_decoder(decoder_input)
         coarse_spectrum = F.softplus(logits)
         refined_spectrum = F.softplus(self.spectrum_refiner(coarse_spectrum, setup_inputs))

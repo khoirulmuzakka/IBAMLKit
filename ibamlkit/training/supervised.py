@@ -9,7 +9,7 @@ import copy
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from ibamlkit.models import ForwardModelBase
+from ibamlkit.models.forward import ForwardModelBase
 from ibamlkit.training.base import ModelTrainer, TrainingResult
 from ibamlkit.training.losses import Chi2Loss
 
