@@ -13,9 +13,9 @@ from .base import ForwardModelBase
 from .base import ForwardModelBase
 from ibamlkit.schema import (
     DatasetInputSpec,
+    ForwardModelSchema,
     ModelInputSpec,
     ModelOutputSpec,
-    ModelSchema,
     ModelTaskSpec,
     TensorFeatureSpec,
 )
@@ -57,7 +57,7 @@ def build_lrn_model_schema(
     model_name: str = "lrn",
     task_method_names: Sequence[str] | None = None,
     output_spectra_lengths: dict[str, int] | None = None,
-) -> ModelSchema:
+) -> ForwardModelSchema:
     """Build a default LRN model schema from a dataset input spec.
 
     The resulting input spec preserves the dataset open-parameter order while
@@ -118,7 +118,7 @@ def build_lrn_model_schema(
     if output_spectra_lengths is None:
         output_spectra_lengths = {method_name: 1 for method_name in task_method_names}
 
-    return ModelSchema(
+    return ForwardModelSchema(
         name=model_name,
         task=ModelTaskSpec(
             task_kind="surrogate",
@@ -288,7 +288,7 @@ class LRNModel(ForwardModelBase):
 
     def __init__(
         self,
-        schema: ModelSchema,
+        schema: ForwardModelSchema,
         *,
         hidden_size: int = 256,
         contribution_size: int = 256,
@@ -431,7 +431,7 @@ class LRNModel(ForwardModelBase):
         )
     
     @staticmethod
-    def _infer_output_size(schema: ModelSchema) -> int:
+    def _infer_output_size(schema: ForwardModelSchema) -> int:
         if schema.outputs.spectra_lengths:
             return sum(schema.outputs.spectra_lengths.values())
         if schema.outputs.feature_dimension > 0:
@@ -439,7 +439,7 @@ class LRNModel(ForwardModelBase):
         raise ValueError("Unable to infer output size from schema.")
 
     @staticmethod
-    def _infer_input_layout(schema: ModelSchema) -> _InputLayout:
+    def _infer_input_layout(schema: ForwardModelSchema) -> _InputLayout:
         setup_feature_indices: list[int] = []
         layer_groups: dict[int, list[tuple[int, TensorFeatureSpec]]] = {}
 

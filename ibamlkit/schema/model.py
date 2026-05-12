@@ -30,7 +30,7 @@ class ModelTaskSpec:
 
 @dataclass(frozen=True)
 class TensorFeatureSpec:
-    """One ordered model-side feature derived from a physical parameter."""
+    """One ordered model-side feature derived from a physical quantity."""
 
     name: str
     source_parameter: str
@@ -121,8 +121,8 @@ class ModelOutputSpec:
 
 
 @dataclass(frozen=True)
-class ModelSchema:
-    """Top-level public description of a model package contract."""
+class _ModelSchemaBase:
+    """Shared metadata for task-specific model schemas."""
 
     name: str
     task: ModelTaskSpec
@@ -131,7 +131,7 @@ class ModelSchema:
     parameters: Sequence[ParameterSpec] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
+    def _validate_common(self) -> None:
         if not self.name:
             raise ValueError("Model name must not be empty.")
 
@@ -139,12 +139,34 @@ class ModelSchema:
         if len(parameter_names) != len(set(parameter_names)):
             raise ValueError("Model parameter names must be unique.")
 
-        known_parameters = set(parameter_names)
+        json.dumps(dict(self.metadata))
+
+    @property
+    def known_parameter_names(self) -> set[str]:
+        return {parameter.name for parameter in self.parameters}
+
+
+@dataclass(frozen=True)
+class ForwardModelSchema(_ModelSchemaBase):
+    """Top-level public description of a forward surrogate model."""
+
+    def __post_init__(self) -> None:
+        self._validate_common()
+        if self.task.task_kind != "surrogate":
+            raise ValueError("ForwardModelSchema requires task_kind='surrogate'.")
+
+        known_parameters = self.known_parameter_names
         if known_parameters:
-            for feature in tuple(self.inputs.features) + tuple(self.outputs.features):
+            for feature in self.inputs.features:
                 if feature.source_parameter not in known_parameters:
                     raise ValueError(
-                        f"Feature '{feature.name}' references unknown parameter "
+                        f"Forward input feature '{feature.name}' references unknown parameter "
+                        f"'{feature.source_parameter}'."
+                    )
+            for feature in self.outputs.features:
+                if feature.source_parameter not in known_parameters:
+                    raise ValueError(
+                        f"Forward output feature '{feature.name}' references unknown parameter "
                         f"'{feature.source_parameter}'."
                     )
 
@@ -155,4 +177,30 @@ class ModelSchema:
                     "Every declared output spectrum must map to a method in task.method_names."
                 )
 
-        json.dumps(dict(self.metadata))
+
+@dataclass(frozen=True)
+class InverseModelSchema(_ModelSchemaBase):
+    """Top-level public description of an inverse model."""
+
+    def __post_init__(self) -> None:
+        self._validate_common()
+        if self.task.task_kind != "inverse":
+            raise ValueError("InverseModelSchema requires task_kind='inverse'.")
+
+        known_parameters = self.known_parameter_names
+        if known_parameters:
+            for feature in self.outputs.features:
+                if feature.source_parameter not in known_parameters:
+                    raise ValueError(
+                        f"Inverse output feature '{feature.name}' references unknown parameter "
+                        f"'{feature.source_parameter}'."
+                    )
+
+        if self.outputs.spectra_names or self.outputs.spectra_lengths:
+            raise ValueError("InverseModelSchema outputs must be parameter features, not spectra.")
+
+        for feature in self.inputs.features:
+            if feature.group not in {"spectrum", "derived"}:
+                raise ValueError(
+                    "Inverse model inputs must be grouped as 'spectrum' or 'derived'."
+                )

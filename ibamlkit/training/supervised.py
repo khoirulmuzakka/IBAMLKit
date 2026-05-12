@@ -9,8 +9,7 @@ import copy
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from ibamlkit.models.forward import ForwardModelBase
-from ibamlkit.training.base import ModelTrainer, TrainingResult
+from ibamlkit.training.base import ModelTrainer, TrainingResult, TrainableTensorModel
 from ibamlkit.training.losses import Chi2Loss
 
 
@@ -53,7 +52,7 @@ class SupervisedTrainer(ModelTrainer):
         if self.verbose:
             print(message)
 
-    def _make_optimizer(self, model: ForwardModelBase, learning_rate: float) -> torch.optim.Optimizer:
+    def _make_optimizer(self, model: TrainableTensorModel, learning_rate: float) -> torch.optim.Optimizer:
         if self.optimizer_name == "adam":
             return torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=self.weight_decay)
         if self.optimizer_name == "sgd":
@@ -72,7 +71,7 @@ class SupervisedTrainer(ModelTrainer):
             )
         raise ValueError(f"Unsupported optimizer_name: {self.optimizer_name}")
 
-    def _loss_over_loader(self, model: ForwardModelBase, loader: DataLoader) -> float:
+    def _loss_over_loader(self, model: TrainableTensorModel, loader: DataLoader) -> float:
         model.eval()
         total_loss = 0.0
         total_items = 0
@@ -88,7 +87,7 @@ class SupervisedTrainer(ModelTrainer):
 
     def fit(
         self,
-        model: ForwardModelBase,
+        model: TrainableTensorModel,
         /,
         *,
         train_inputs: torch.Tensor,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ibamlkit.data import DatasetBatchReader
-from ibamlkit.schema import IBADataset, ModelSchema, ParameterSpec
+from ibamlkit.schema import ForwardModelSchema, IBADataset, InverseModelSchema, ParameterSpec
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,18 @@ class PreparedSurrogateDataset:
     target_lengths: np.ndarray | None
 
 
+@dataclass(frozen=True)
+class PreparedInverseDataset:
+    """Canonical matrices prepared for inverse-model training."""
+
+    reference_dataset: IBADataset
+    inputs: np.ndarray
+    targets_full: np.ndarray
+    targets_selected: np.ndarray
+    target_parameter_names: tuple[str, ...]
+    input_lengths: np.ndarray | None
+
+
 def _open_parameter_index(parameters: list[ParameterSpec]) -> dict[str, int]:
     return {parameter.name: index for index, parameter in enumerate(parameters)}
 
@@ -28,7 +40,7 @@ def _open_parameter_index(parameters: list[ParameterSpec]) -> dict[str, int]:
 def prepare_variable_layer_surrogate_dataset(
     datasets: list[IBADataset],
     *,
-    schema: ModelSchema,
+    schema: ForwardModelSchema,
     method_name: str,
 ) -> PreparedSurrogateDataset:
     """Pad and merge variable-layer datasets into one max-layer training matrix.
@@ -111,4 +123,51 @@ def prepare_variable_layer_surrogate_dataset(
         inputs_selected=inputs_selected,
         targets=targets,
         target_lengths=target_lengths,
+    )
+
+
+def prepare_inverse_dataset(
+    dataset: IBADataset,
+    *,
+    schema: InverseModelSchema,
+    method_name: str,
+) -> PreparedInverseDataset:
+    """Project one IBADataset into matrices for inverse-model training.
+
+    Inputs come from one selected measured/simulated spectrum. Targets come from
+    the dataset open-parameter matrix and are reduced to the parameter order
+    declared in ``schema.outputs.features``.
+    """
+
+    if method_name not in dataset.spectra:
+        raise KeyError(f"Method {method_name!r} not found in dataset spectra.")
+    inputs = np.asarray(dataset.spectra[method_name], dtype=np.float32)
+    targets_full = np.asarray(dataset.open_parameter_values, dtype=np.float32)
+    open_parameters = list(dataset.input_spec.open_parameters)
+    open_parameter_index = _open_parameter_index(open_parameters)
+
+    selected_indices: list[int] = []
+    target_parameter_names: list[str] = []
+    for feature in schema.outputs.features:
+        try:
+            selected_indices.append(open_parameter_index[feature.source_parameter])
+        except KeyError as exc:
+            raise KeyError(
+                f"Schema output feature {feature.name!r} references unknown open parameter "
+                f"{feature.source_parameter!r}."
+            ) from exc
+        target_parameter_names.append(feature.source_parameter)
+
+    targets_selected = np.asarray(targets_full[:, selected_indices], dtype=np.float32)
+    input_lengths = None
+    if dataset.spectra_lengths is not None:
+        input_lengths = np.asarray(dataset.spectra_lengths[method_name], dtype=np.int32)
+
+    return PreparedInverseDataset(
+        reference_dataset=dataset,
+        inputs=inputs,
+        targets_full=targets_full,
+        targets_selected=targets_selected,
+        target_parameter_names=tuple(target_parameter_names),
+        input_lengths=input_lengths,
     )

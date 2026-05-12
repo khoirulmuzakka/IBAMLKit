@@ -10,7 +10,7 @@ from torch import nn
 
 from .base import ForwardModelBase
 from .lrn import LRNModel
-from ibamlkit.schema import ModelSchema
+from ibamlkit.schema import ForwardModelSchema
 
 
 class _LocalSpectrumRefiner(nn.Module):
@@ -77,7 +77,7 @@ class LTNModel(ForwardModelBase):
 
     def __init__(
         self,
-        schema: ModelSchema,
+        schema: ForwardModelSchema,
         *,
         model_dim: int = 256,
         num_heads: int = 8,

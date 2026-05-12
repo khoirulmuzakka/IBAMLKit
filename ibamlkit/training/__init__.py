@@ -1,7 +1,12 @@
 """Public training APIs."""
 
 from .base import ModelTrainer, TrainingBatch, TrainingResult
-from .datasets import PreparedSurrogateDataset, prepare_variable_layer_surrogate_dataset
+from .datasets import (
+    PreparedInverseDataset,
+    PreparedSurrogateDataset,
+    prepare_inverse_dataset,
+    prepare_variable_layer_surrogate_dataset,
+)
 from .losses import Chi2Loss, Log1pMSELoss, PeakAwareLoss
 from .preprocessing import (
     ArrayTransform,
@@ -31,6 +36,7 @@ __all__ = [
     "MinMaxScaler",
     "ModelTrainer",
     "PeakAwareLoss",
+    "PreparedInverseDataset",
     "PreparedSurrogateDataset",
     "ROISelector",
     "SpectrumPreprocessor",
@@ -41,6 +47,7 @@ __all__ = [
     "TrainingResult",
     "TrainValTestSplit",
     "TransformPipeline",
+    "prepare_inverse_dataset",
     "prepare_variable_layer_surrogate_dataset",
     "shuffle_in_unison",
     "split_train_val_test",
