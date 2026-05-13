@@ -8,6 +8,7 @@ from .datasets import (
     prepare_variable_layer_surrogate_dataset,
 )
 from .losses import Chi2Loss, Log1pMSELoss, PeakAwareLoss
+from .package import ModelPackageArtifacts, export_as_package
 from .preprocessing import (
     ArrayTransform,
     BinMerger,
@@ -24,10 +25,12 @@ from .preprocessing import (
     TransformPipeline,
 )
 from .supervised import EpochSchedule, SupervisedTrainer
+from .supervised import BlockShuffleBatchSampler
 
 __all__ = [
     "ArrayTransform",
     "BinMerger",
+    "BlockShuffleBatchSampler",
     "Chi2Loss",
     "ConstantFactorTransform",
     "EpochSchedule",
@@ -35,6 +38,7 @@ __all__ = [
     "Log1pMSELoss",
     "MinMaxScaler",
     "ModelTrainer",
+    "ModelPackageArtifacts",
     "PeakAwareLoss",
     "PreparedInverseDataset",
     "PreparedSurrogateDataset",
@@ -47,6 +51,7 @@ __all__ = [
     "TrainingResult",
     "TrainValTestSplit",
     "TransformPipeline",
+    "export_as_package",
     "prepare_inverse_dataset",
     "prepare_variable_layer_surrogate_dataset",
     "shuffle_in_unison",

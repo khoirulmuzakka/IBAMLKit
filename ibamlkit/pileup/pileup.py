@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from typing import Mapping, Sequence
 
 import numpy as np
 
 from ibamlkit.schema import DatasetInputSpec, ParameterSpec
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 current_file_directory = os.path.dirname(os.path.abspath(__file__))
 custom_path = os.path.join(current_file_directory, "lib")
@@ -233,6 +239,92 @@ def rebin_histogram(bin_edges_old, bin_edges_new, spectrum):
     return rebinpp(bin_edges_old, bin_edges_new, spectrum)
 
 
+def _sanitize_monotonic_calibration_arrays(
+    calibration_offset: np.ndarray,
+    calibration_linear: np.ndarray,
+    calibration_quadratic: np.ndarray,
+    *,
+    n_channels: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    calibration_offset = np.asarray(calibration_offset, dtype=np.float64)
+    calibration_linear = np.asarray(calibration_linear, dtype=np.float64)
+    calibration_quadratic = np.asarray(calibration_quadratic, dtype=np.float64)
+    if calibration_linear.shape != calibration_quadratic.shape:
+        raise ValueError("calibration_linear and calibration_quadratic must have matching shapes.")
+
+    # A sufficient monotonicity check for E = a + b*x + c*x^2 on x in [0, n_channels].
+    # If this fails, clamp to a safe linear fallback rather than letting the C++
+    # extension abort the whole batch.
+    invalid_mask = (calibration_linear <= 0.0) | ((calibration_linear + 2.0 * calibration_quadratic * float(n_channels)) <= 0.0)
+    if not np.any(invalid_mask):
+        return calibration_offset, calibration_linear, calibration_quadratic
+
+    warnings.warn(
+        f"Clamping {int(np.count_nonzero(invalid_mask))} calibration row(s) with non-monotonic energy edges.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    linear = calibration_linear.copy()
+    quadratic = calibration_quadratic.copy()
+    linear[invalid_mask] = np.maximum(linear[invalid_mask], 1e-12)
+    quadratic[invalid_mask] = np.maximum(quadratic[invalid_mask], 0.0)
+    return calibration_offset, linear, quadratic
+
+
+def compute_rebin_energy_edges(
+    channel_space_spectra: np.ndarray,
+    channel_lengths: np.ndarray | None,
+    *,
+    calibration_offset,
+    calibration_linear,
+    calibration_quadratic,
+    energy_bin_width: float = 1.0,
+    row_indices: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str = "Rebinning spectra",
+) -> np.ndarray:
+    channel_space_spectra = np.asarray(channel_space_spectra, dtype=np.float32)
+    if row_indices is None:
+        source_indices = np.arange(channel_space_spectra.shape[0], dtype=np.int64)
+    else:
+        source_indices = np.asarray(row_indices, dtype=np.int64)
+    sample_count = int(source_indices.shape[0])
+    channel_space_width = int(channel_space_spectra.shape[1])
+    if channel_lengths is None:
+        channel_lengths = np.full((channel_space_spectra.shape[0],), channel_space_width, dtype=np.int32)
+    else:
+        channel_lengths = np.asarray(channel_lengths, dtype=np.int32)
+
+    calibration_offset = np.asarray(calibration_offset, dtype=np.float64)
+    calibration_linear = np.asarray(calibration_linear, dtype=np.float64)
+    calibration_quadratic = np.asarray(calibration_quadratic, dtype=np.float64)
+
+    energy_index_iterable = range(sample_count)
+    if show_progress and tqdm is not None:
+        energy_index_iterable = tqdm(energy_index_iterable, desc=progress_desc, unit="spectra")
+
+    max_energy = 0.0
+    for index in energy_index_iterable:
+        source_index = int(source_indices[index])
+        width = max(0, min(int(channel_lengths[source_index]), channel_space_width))
+        if width <= 0:
+            continue
+        channel_edges = np.arange(width + 1, dtype=np.float64)
+        energy_edges_old = (
+            calibration_offset[source_index]
+            + calibration_linear[source_index] * channel_edges
+            + calibration_quadratic[source_index] * (channel_edges**2)
+        )
+        max_energy = max(max_energy, float(np.max(energy_edges_old)))
+
+    return np.arange(
+        0.0,
+        np.ceil(max_energy) + float(energy_bin_width),
+        float(energy_bin_width),
+        dtype=np.float64,
+    )
+
+
 def rebin_spectra_to_energy_space(
     channel_space_spectra: np.ndarray,
     channel_lengths: np.ndarray | None,
@@ -243,11 +335,21 @@ def rebin_spectra_to_energy_space(
     energy_bin_width: float = 1.0,
     target_width: int | None = None,
     energy_spectrum_scale: float = 1e-3,
+    row_indices: np.ndarray | None = None,
+    energy_edges: np.ndarray | None = None,
+    out: np.ndarray | None = None,
+    show_progress: bool = False,
+    progress_desc: str = "Rebinning spectra",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     channel_space_spectra = np.asarray(channel_space_spectra, dtype=np.float32)
-    sample_count = int(channel_space_spectra.shape[0])
+    if row_indices is None:
+        source_indices = np.arange(channel_space_spectra.shape[0], dtype=np.int64)
+    else:
+        source_indices = np.asarray(row_indices, dtype=np.int64)
+    sample_count = int(source_indices.shape[0])
+    channel_space_width = int(channel_space_spectra.shape[1])
     if channel_lengths is None:
-        channel_lengths = np.full((sample_count,), channel_space_spectra.shape[1], dtype=np.int32)
+        channel_lengths = np.full((channel_space_spectra.shape[0],), channel_space_width, dtype=np.int32)
     else:
         channel_lengths = np.asarray(channel_lengths, dtype=np.int32)
 
@@ -255,52 +357,68 @@ def rebin_spectra_to_energy_space(
     calibration_linear = np.asarray(calibration_linear, dtype=np.float64)
     calibration_quadratic = np.asarray(calibration_quadratic, dtype=np.float64)
 
-    max_energy = 0.0
-    for index in range(sample_count):
-        width = int(channel_lengths[index])
-        channel_edges = np.arange(width + 1, dtype=np.float64)
-        energy_edges_old = (
-            calibration_offset[index]
-            + calibration_linear[index] * channel_edges
-            + calibration_quadratic[index] * (channel_edges**2)
+    if energy_edges is None:
+        energy_edges = compute_rebin_energy_edges(
+            channel_space_spectra,
+            channel_lengths,
+            calibration_offset=calibration_offset,
+            calibration_linear=calibration_linear,
+            calibration_quadratic=calibration_quadratic,
+            energy_bin_width=energy_bin_width,
+            row_indices=source_indices,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
         )
-        max_energy = max(max_energy, float(np.max(energy_edges_old)))
+    else:
+        energy_edges = np.asarray(energy_edges, dtype=np.float64)
 
-    energy_edges = np.arange(
-        0.0,
-        np.ceil(max_energy) + float(energy_bin_width),
-        float(energy_bin_width),
-        dtype=np.float64,
-    )
-    rebinned: list[np.ndarray] = []
     rebinned_lengths = np.zeros((sample_count,), dtype=np.int32)
-    output_width = None
+    output_width = (
+        max(energy_edges.shape[0] - 1, 0)
+        if target_width is None
+        else max(0, min(int(target_width), energy_edges.shape[0] - 1))
+    )
+    if out is None:
+        rebinned = np.zeros((sample_count, output_width), dtype=np.float32)
+    else:
+        rebinned = np.asarray(out)
+        if rebinned.shape != (sample_count, output_width):
+            raise ValueError(
+                f"out has shape {rebinned.shape}, expected {(sample_count, output_width)}"
+            )
+        if rebinned.dtype != np.float32:
+            raise ValueError("out must have dtype float32")
+        rebinned.fill(0.0)
 
-    for index in range(sample_count):
-        width = int(channel_lengths[index])
+    rebin_index_iterable = range(sample_count)
+    if show_progress and tqdm is not None:
+        rebin_index_iterable = tqdm(
+            rebin_index_iterable,
+            desc=f"{progress_desc} output",
+            unit="spectra",
+        )
+
+    for output_index in rebin_index_iterable:
+        source_index = int(source_indices[output_index])
+        width = max(0, min(int(channel_lengths[source_index]), channel_space_width))
+        if width <= 0:
+            rebinned_lengths[output_index] = 0
+            continue
         channel_edges = np.arange(width + 1, dtype=np.float64)
         energy_edges_old = (
-            calibration_offset[index]
-            + calibration_linear[index] * channel_edges
-            + calibration_quadratic[index] * (channel_edges**2)
+            calibration_offset[source_index]
+            + calibration_linear[source_index] * channel_edges
+            + calibration_quadratic[source_index] * (channel_edges**2)
         )
         rebinned_spectrum = np.asarray(
-            rebin_histogram(energy_edges_old, energy_edges, channel_space_spectra[index, :width]),
+            rebin_histogram(energy_edges_old, energy_edges, channel_space_spectra[source_index, :width]),
             dtype=np.float32,
         ) * float(energy_spectrum_scale)
-        if output_width is None:
-            output_width = (
-                rebinned_spectrum.shape[0]
-                if target_width is None
-                else min(int(target_width), rebinned_spectrum.shape[0])
-            )
-        current = rebinned_spectrum[:output_width]
-        rebinned_lengths[index] = min(rebinned_spectrum.shape[0], output_width)
-        if current.shape[0] < output_width:
-            current = np.pad(current, (0, output_width - current.shape[0]), mode="constant")
-        rebinned.append(np.asarray(current, dtype=np.float32))
+        current_width = min(rebinned_spectrum.shape[0], output_width)
+        rebinned[output_index, :current_width] = rebinned_spectrum[:current_width]
+        rebinned_lengths[output_index] = current_width
 
-    return np.stack(rebinned, axis=0), rebinned_lengths, energy_edges
+    return rebinned, rebinned_lengths, energy_edges
 
 
 def fast_pileup_batch(spectra_list, real_times, live_times, fudge_factors, clip_negative=True):
@@ -349,6 +467,7 @@ def convert_to_channel_space_and_pileup_batch(
     live_times = _as_array(live_times)
     fudge_factors = _as_array(fudge_factors)
     r = _as_array(r)
+    a, b, c = _sanitize_monotonic_calibration_arrays(a, b, c, n_channels=E_space_spectra.shape[1])
 
     return convert_to_channel_space_and_pileup_batchpp(
         a,

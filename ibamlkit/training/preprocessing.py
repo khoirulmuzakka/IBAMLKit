@@ -18,14 +18,14 @@ class ArrayTransform:
     def fit(self, x: np.ndarray) -> "ArrayTransform":
         raise NotImplementedError
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         raise NotImplementedError
 
-    def fit_transform(self, x: np.ndarray) -> np.ndarray:
+    def fit_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         self.fit(x)
-        return self.transform(x)
+        return self.transform(x, out=out)
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         raise NotImplementedError
 
 
@@ -38,11 +38,19 @@ class IdentityTransform(ArrayTransform):
         self.is_fitted = True
         return self
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        return np.asarray(x, dtype=np.float32)
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if out is None:
+            return x
+        np.copyto(out, x, casting="unsafe")
+        return out
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
-        return np.asarray(x, dtype=np.float32)
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if out is None:
+            return x
+        np.copyto(out, x, casting="unsafe")
+        return out
 
 
 class ConstantFactorTransform(ArrayTransform):
@@ -60,15 +68,23 @@ class ConstantFactorTransform(ArrayTransform):
         self.is_fitted = True
         return self
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted:
             raise RuntimeError("ConstantFactorTransform must be fitted before transform().")
-        return (np.asarray(x, dtype=np.float32) * self.factor).astype(np.float32)
+        x = np.asarray(x, dtype=np.float32)
+        if out is None:
+            return (x * self.factor).astype(np.float32)
+        np.multiply(x, self.factor, out=out, casting="unsafe")
+        return out
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted:
             raise RuntimeError("ConstantFactorTransform must be fitted before inverse_transform().")
-        return (np.asarray(x, dtype=np.float32) / self.factor).astype(np.float32)
+        x = np.asarray(x, dtype=np.float32)
+        if out is None:
+            return (x / self.factor).astype(np.float32)
+        np.divide(x, self.factor, out=out, casting="unsafe")
+        return out
 
 
 class MinMaxScaler(ArrayTransform):
@@ -97,21 +113,35 @@ class MinMaxScaler(ArrayTransform):
         self.is_fitted = True
         return self
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted or self.x_min is None or self.x_scale is None:
             raise RuntimeError("MinMaxScaler must be fitted before transform().")
         x = np.asarray(x, dtype=np.float32)
-        return (self.low + (self.high - self.low) * (x - self.x_min) / self.x_scale).astype(
-            np.float32
-        )
+        if out is None:
+            return (self.low + (self.high - self.low) * (x - self.x_min) / self.x_scale).astype(
+                np.float32
+            )
+        np.copyto(out, x, casting="unsafe")
+        np.subtract(out, self.x_min, out=out)
+        np.divide(out, self.x_scale, out=out)
+        np.multiply(out, (self.high - self.low), out=out)
+        np.add(out, self.low, out=out)
+        return out
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted or self.x_min is None or self.x_scale is None:
             raise RuntimeError("MinMaxScaler must be fitted before inverse_transform().")
         x = np.asarray(x, dtype=np.float32)
-        return (((x - self.low) / (self.high - self.low)) * self.x_scale + self.x_min).astype(
-            np.float32
-        )
+        if out is None:
+            return (((x - self.low) / (self.high - self.low)) * self.x_scale + self.x_min).astype(
+                np.float32
+            )
+        np.copyto(out, x, casting="unsafe")
+        np.subtract(out, self.low, out=out)
+        np.divide(out, (self.high - self.low), out=out)
+        np.multiply(out, self.x_scale, out=out)
+        np.add(out, self.x_min, out=out)
+        return out
 
 
 class StandardScaler(ArrayTransform):
@@ -135,17 +165,27 @@ class StandardScaler(ArrayTransform):
         self.is_fitted = True
         return self
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted or self.x_mean is None or self.x_std is None:
             raise RuntimeError("StandardScaler must be fitted before transform().")
         x = np.asarray(x, dtype=np.float32)
-        return ((x - self.x_mean) / self.x_std).astype(np.float32)
+        if out is None:
+            return ((x - self.x_mean) / self.x_std).astype(np.float32)
+        np.copyto(out, x, casting="unsafe")
+        np.subtract(out, self.x_mean, out=out)
+        np.divide(out, self.x_std, out=out)
+        return out
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted or self.x_mean is None or self.x_std is None:
             raise RuntimeError("StandardScaler must be fitted before inverse_transform().")
         x = np.asarray(x, dtype=np.float32)
-        return (x * self.x_std + self.x_mean).astype(np.float32)
+        if out is None:
+            return (x * self.x_std + self.x_mean).astype(np.float32)
+        np.copyto(out, x, casting="unsafe")
+        np.multiply(out, self.x_std, out=out)
+        np.add(out, self.x_mean, out=out)
+        return out
 
 
 class TransformPipeline(ArrayTransform):
@@ -165,20 +205,20 @@ class TransformPipeline(ArrayTransform):
         self.is_fitted = True
         return self
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
+    def transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted:
             raise RuntimeError("TransformPipeline must be fitted before transform().")
         x_work = np.asarray(x, dtype=np.float32)
         for transform in self.transforms:
-            x_work = transform.transform(x_work)
+            x_work = transform.transform(x_work, out=out if transform is self.transforms[-1] else None)
         return x_work.astype(np.float32)
 
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, x: np.ndarray, *, out: np.ndarray | None = None) -> np.ndarray:
         if not self.is_fitted:
             raise RuntimeError("TransformPipeline must be fitted before inverse_transform().")
         x_work = np.asarray(x, dtype=np.float32)
         for transform in reversed(self.transforms):
-            x_work = transform.inverse_transform(x_work)
+            x_work = transform.inverse_transform(x_work, out=out if transform is self.transforms[0] else None)
         return x_work.astype(np.float32)
 
 

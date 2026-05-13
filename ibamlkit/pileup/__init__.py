@@ -1,5 +1,6 @@
 from .pileup import (
     apply_channel_space_pileup,
+    compute_rebin_energy_edges,
     convert_energy_spectra_to_channel_space_and_pileup,
     convert_to_channel_space_and_pileup_batch,
     fast_pileup_batch,
@@ -13,6 +14,7 @@ from .pileup import (
 
 __all__ = [
     "apply_channel_space_pileup",
+    "compute_rebin_energy_edges",
     "convert_energy_spectra_to_channel_space_and_pileup",
     "convert_to_channel_space_and_pileup_batch",
     "fast_pileup_batch",

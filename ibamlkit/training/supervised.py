@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 import copy
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import BatchSampler, DataLoader, TensorDataset
 
 from ibamlkit.training.base import ModelTrainer, TrainingResult, TrainableTensorModel
 from ibamlkit.training.losses import Chi2Loss
@@ -22,6 +23,62 @@ class EpochSchedule:
     batch_size: int
 
 
+class BlockShuffleBatchSampler(BatchSampler):
+    """Yield contiguous batches in shuffled block order.
+
+    This preserves most of the locality benefits of sequential reads while
+    still randomizing the order of training data at the block level.
+    """
+
+    def __init__(
+        self,
+        sample_count: int,
+        batch_size: int,
+        *,
+        block_size: int | None = None,
+        seed: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        if sample_count < 0:
+            raise ValueError("sample_count must be non-negative.")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1.")
+        self.sample_count = int(sample_count)
+        self.batch_size = int(batch_size)
+        self.block_size = int(block_size) if block_size is not None else max(self.batch_size * 32, self.batch_size)
+        if self.block_size < self.batch_size:
+            raise ValueError("block_size must be >= batch_size.")
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self._epoch = 0
+
+    def __iter__(self):
+        if self.sample_count == 0:
+            return iter(())
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+        block_starts = np.arange(0, self.sample_count, self.block_size, dtype=np.int64)
+        rng.shuffle(block_starts)
+
+        def _generator():
+            for block_start in block_starts:
+                block_stop = min(int(block_start) + self.block_size, self.sample_count)
+                for batch_start in range(int(block_start), block_stop, self.batch_size):
+                    batch_stop = min(batch_start + self.batch_size, block_stop)
+                    if self.drop_last and batch_stop - batch_start < self.batch_size:
+                        continue
+                    yield list(range(batch_start, batch_stop))
+
+        return _generator()
+
+    def __len__(self) -> int:
+        if self.sample_count == 0:
+            return 0
+        if self.drop_last:
+            return self.sample_count // self.batch_size
+        return (self.sample_count + self.batch_size - 1) // self.batch_size
+
+
 class SupervisedTrainer(ModelTrainer):
     """Basic trainer for supervised forward-model fitting."""
 
@@ -34,6 +91,10 @@ class SupervisedTrainer(ModelTrainer):
         max_grad_norm: float | None = 1.0,
         early_stopping_patience: int = 10,
         eval_batch_size: int = 500,
+        track_train_loss: bool = False,
+        batch_shuffle_mode: str = "full",
+        shuffle_block_size: int | None = None,
+        shuffle_seed: int = 0,
         device: str = "cpu",
         verbose: bool = True,
         log_every_epochs: int = 1,
@@ -44,6 +105,10 @@ class SupervisedTrainer(ModelTrainer):
         self.max_grad_norm = max_grad_norm
         self.early_stopping_patience = early_stopping_patience
         self.eval_batch_size = eval_batch_size
+        self.track_train_loss = bool(track_train_loss)
+        self.batch_shuffle_mode = str(batch_shuffle_mode).strip().lower()
+        self.shuffle_block_size = None if shuffle_block_size is None else int(shuffle_block_size)
+        self.shuffle_seed = int(shuffle_seed)
         self.device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
         self.verbose = verbose
         self.log_every_epochs = max(1, int(log_every_epochs))
@@ -109,7 +174,14 @@ class SupervisedTrainer(ModelTrainer):
         model.to(self.device)
         pin_memory = self.device.type == "cuda"
         train_dataset = TensorDataset(train_inputs, train_targets)
-        eval_train_loader = DataLoader(train_dataset, batch_size=self.eval_batch_size, shuffle=False, pin_memory=pin_memory)
+        eval_train_loader = None
+        if self.track_train_loss:
+            eval_train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.eval_batch_size,
+                shuffle=False,
+                pin_memory=pin_memory,
+            )
         val_loader = DataLoader(
             TensorDataset(val_inputs, val_targets),
             batch_size=self.eval_batch_size,
@@ -127,11 +199,14 @@ class SupervisedTrainer(ModelTrainer):
         )
         best_state = copy.deepcopy(model.state_dict())
         best_val_loss = self._loss_over_loader(model, val_loader)
-        train_loss = self._loss_over_loader(model, eval_train_loader)
+        train_loss = None
+        if eval_train_loader is not None:
+            train_loss = self._loss_over_loader(model, eval_train_loader)
         epochs_completed = 0
-        self._log(
-            f"Initial losses: train={train_loss:.6f}, val={best_val_loss:.6f}"
-        )
+        if train_loss is None:
+            self._log(f"Initial losses: val={best_val_loss:.6f}")
+        else:
+            self._log(f"Initial losses: train={train_loss:.6f}, val={best_val_loss:.6f}")
 
         schedule_list = list(schedule)
         for phase_index, phase in enumerate(schedule_list, start=1):
@@ -140,12 +215,35 @@ class SupervisedTrainer(ModelTrainer):
                 f"{phase_index}/{len(schedule_list)}: "
                 f"lr={phase.learning_rate:g}, epochs={phase.epochs}, batch_size={phase.batch_size}"
             )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=phase.batch_size,
-                shuffle=True,
-                pin_memory=pin_memory,
-            )
+            if self.batch_shuffle_mode == "full":
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=phase.batch_size,
+                    shuffle=True,
+                    pin_memory=pin_memory,
+                )
+            elif self.batch_shuffle_mode == "block":
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_sampler=BlockShuffleBatchSampler(
+                        len(train_dataset),
+                        phase.batch_size,
+                        block_size=self.shuffle_block_size,
+                        seed=self.shuffle_seed + phase_index,
+                    ),
+                    pin_memory=pin_memory,
+                )
+            elif self.batch_shuffle_mode == "sequential":
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=phase.batch_size,
+                    shuffle=False,
+                    pin_memory=pin_memory,
+                )
+            else:
+                raise ValueError(
+                    "batch_shuffle_mode must be one of {'full', 'block', 'sequential'}"
+                )
             optimizer = self._make_optimizer(model, phase.learning_rate)
             stale_epochs = 0
 
@@ -178,16 +276,25 @@ class SupervisedTrainer(ModelTrainer):
                     or improved
                 )
                 if should_log:
-                    train_loss_epoch = self._loss_over_loader(model, eval_train_loader)
                     status = "improved" if improved else f"stale={stale_epochs}"
-                    self._log(
-                        f"  epoch {phase_epoch}/{phase.epochs} "
-                        f"(global {epochs_completed}): "
-                        f"train={train_loss_epoch:.6f}, "
-                        f"val={val_loss:.6f}, "
-                        f"best={best_val_loss:.6f}, "
-                        f"{status}"
-                    )
+                    if eval_train_loader is None:
+                        self._log(
+                            f"  epoch {phase_epoch}/{phase.epochs} "
+                            f"(global {epochs_completed}): "
+                            f"val={val_loss:.6f}, "
+                            f"best={best_val_loss:.6f}, "
+                            f"{status}"
+                        )
+                    else:
+                        train_loss_epoch = self._loss_over_loader(model, eval_train_loader)
+                        self._log(
+                            f"  epoch {phase_epoch}/{phase.epochs} "
+                            f"(global {epochs_completed}): "
+                            f"train={train_loss_epoch:.6f}, "
+                            f"val={val_loss:.6f}, "
+                            f"best={best_val_loss:.6f}, "
+                            f"{status}"
+                        )
                 if stale_epochs >= self.early_stopping_patience:
                     self._log(
                         "  early stopping triggered: "
@@ -196,19 +303,26 @@ class SupervisedTrainer(ModelTrainer):
                     break
 
         model.load_state_dict(best_state)
-        train_loss = self._loss_over_loader(model, eval_train_loader)
+        if eval_train_loader is not None:
+            train_loss = self._loss_over_loader(model, eval_train_loader)
         model.eval()
-        self._log(
-            f"Training finished: epochs_completed={epochs_completed}, "
-            f"train={train_loss:.6f}, val={best_val_loss:.6f}"
-        )
+        if train_loss is None:
+            self._log(
+                f"Training finished: epochs_completed={epochs_completed}, "
+                f"val={best_val_loss:.6f}"
+            )
+        else:
+            self._log(
+                f"Training finished: epochs_completed={epochs_completed}, "
+                f"train={train_loss:.6f}, val={best_val_loss:.6f}"
+            )
 
+        metrics = {"val_loss": float(best_val_loss)}
+        if train_loss is not None:
+            metrics["train_loss"] = float(train_loss)
         return TrainingResult(
             epochs_completed=epochs_completed,
-            metrics={
-                "train_loss": float(train_loss),
-                "val_loss": float(best_val_loss),
-            },
+            metrics=metrics,
             metadata={
                 "device": self.device.type,
                 "optimizer": self.optimizer_name,
