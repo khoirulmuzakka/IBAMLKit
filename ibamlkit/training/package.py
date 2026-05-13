@@ -149,6 +149,9 @@ def build_package_manifest(
 
     input_spec_dict = _dataset_input_spec_to_dict(artifacts.input_spec)
     model_schema_dict = _model_schema_to_dict(schema)
+    output_dimension = int(schema.outputs.feature_dimension)
+    if output_dimension <= 0 and schema.outputs.spectra_lengths:
+        output_dimension = int(sum(schema.outputs.spectra_lengths.values()))
     manifest = {
         "format": "ibamlkit.onnx-package",
         "format_version": 1,
@@ -158,7 +161,7 @@ def build_package_manifest(
             "onnx_file": onnx_filename,
             "opset_version": int(opset_version),
             "input_dimension": int(schema.inputs.dimension),
-            "output_dimension": int(schema.outputs.feature_dimension),
+            "output_dimension": output_dimension,
             "schema": model_schema_dict,
         },
         "dataset": input_spec_dict,

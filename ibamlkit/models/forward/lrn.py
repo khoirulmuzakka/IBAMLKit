@@ -357,19 +357,33 @@ class LRNModel(ForwardModelBase):
         for layer_index, concentration_indices in enumerate(self.concentration_indices):
             if not concentration_indices:
                 continue
+            layer_indices = self.layer_feature_indices[layer_index].to(device=inputs.device)
+            concentration_index = torch.tensor(
+                concentration_indices,
+                device=inputs.device,
+                dtype=torch.long,
+            )
             current = normalized.index_select(
                 dim=1,
-                index=self.layer_feature_indices[layer_index].to(device=inputs.device),
+                index=layer_indices,
             )
-            concentrations = current[:, concentration_indices].clamp_min(0.0)
+            concentrations = current.index_select(dim=1, index=concentration_index).clamp_min(0.0)
             sums = concentrations.sum(dim=1, keepdim=True)
             concentrations = concentrations / torch.where(
                 sums > 0.0,
                 sums,
                 torch.ones_like(sums),
             )
-            current[:, concentration_indices] = concentrations
-            normalized[:, self.layer_feature_indices[layer_index].to(device=inputs.device)] = current
+            current = current.scatter(
+                dim=1,
+                index=concentration_index.unsqueeze(0).expand(current.shape[0], -1),
+                src=concentrations,
+            )
+            normalized = normalized.scatter(
+                dim=1,
+                index=layer_indices.unsqueeze(0).expand(inputs.shape[0], -1),
+                src=current,
+            )
         return normalized
 
     def split_inputs(self, inputs: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -415,8 +429,6 @@ class LRNModel(ForwardModelBase):
 
         for current_layer in layer_inputs:
             mask = (~(current_layer == 0).all(dim=1)).float().unsqueeze(1)
-            if mask.sum() == 0:
-                break
             contribution, next_hidden = self.layer_block(current_layer, setup_inputs, hidden_state)
             contribution_total = contribution_total + contribution * mask
             hidden_state = hidden_state * (1.0 - mask) + next_hidden * mask
