@@ -56,6 +56,15 @@ class GenerationFailure:
     chunk_index: int | None = None
 
 
+@dataclass(frozen=True)
+class _ValidationFailure:
+    method_name: str
+    reason: str
+    primary_length: int
+    validation_length: int
+    chi2: float | None = None
+
+
 class _SIMNRAMethodSession:
     """One thread-local SIMNRA session for a single method."""
 
@@ -470,6 +479,11 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         print_progress: bool = True,
         simnra_retry_limit: int = 2,
         allow_failed_samples: bool = True,
+        validation_enabled: bool = True,
+        validation_methods: Sequence[str] | None = None,
+        validation_chi2_threshold: float = 10.0,
+        validation_max_attempts: int = 3,
+        validation_require_matching_length: bool = True,
         log_concentration_corrections: bool = False,
         concentration_correction_threshold: float = 1e-3,
     ):
@@ -487,6 +501,25 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         self.print_progress = print_progress
         self.simnra_retry_limit = max(0, int(simnra_retry_limit))
         self.allow_failed_samples = bool(allow_failed_samples)
+        self.validation_enabled = bool(validation_enabled)
+        available_method_names = {method.name for method in input_spec.methods}
+        if validation_methods is None:
+            self.validation_methods = tuple(method.name for method in input_spec.methods)
+        else:
+            resolved_validation_methods = tuple(str(name) for name in validation_methods)
+            unknown_method_names = sorted(
+                method_name
+                for method_name in resolved_validation_methods
+                if method_name not in available_method_names
+            )
+            if unknown_method_names:
+                raise ValueError(
+                    f"validation_methods contains unknown method names: {unknown_method_names}"
+                )
+            self.validation_methods = resolved_validation_methods
+        self.validation_chi2_threshold = max(0.0, float(validation_chi2_threshold))
+        self.validation_max_attempts = max(1, int(validation_max_attempts))
+        self.validation_require_matching_length = bool(validation_require_matching_length)
         self.log_concentration_corrections = bool(log_concentration_corrections)
         self.concentration_correction_threshold = max(0.0, float(concentration_correction_threshold))
         self._warning_lock = threading.Lock()
@@ -540,17 +573,18 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                 started_at=started_at,
                 message="Starting in-memory generation.",
             )
-            spectra, spectra_lengths = self._generate_spectra_matrices(
+            accepted_open_values, accepted_sample_ids, spectra, spectra_lengths = self._generate_spectra_matrices(
                 open_values,
+                sample_ids=resolved_sample_ids,
                 executor=executor,
                 started_at=started_at,
             )
             return IBADataset(
                 input_spec=self.input_spec,
-                open_parameter_values=open_values,
+                open_parameter_values=accepted_open_values,
                 spectra=spectra,
                 spectra_lengths=spectra_lengths,
-                sample_ids=resolved_sample_ids,
+                sample_ids=accepted_sample_ids,
             )
         finally:
             if owns_executor:
@@ -603,8 +637,14 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                     chunk_total=chunk_total,
                     message=f"Generating chunk {chunk_index}/{chunk_total}.",
                 )
-                chunk_spectra, chunk_spectra_lengths = self._generate_spectra_matrices(
+                (
+                    accepted_chunk_open_values,
+                    accepted_chunk_sample_ids,
+                    chunk_spectra,
+                    chunk_spectra_lengths,
+                ) = self._generate_spectra_matrices(
                     chunk_open_values,
+                    sample_ids=chunk_sample_ids,
                     executor=executor,
                     started_at=started_at,
                     chunk_index=chunk_index,
@@ -612,12 +652,23 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                     global_offset=start,
                     global_total=open_values.shape[0],
                 )
+                if accepted_chunk_open_values.shape[0] == 0:
+                    self._emit_progress(
+                        phase="chunk_skipped",
+                        completed=end,
+                        total=open_values.shape[0],
+                        started_at=started_at,
+                        chunk_index=chunk_index,
+                        chunk_total=chunk_total,
+                        message=f"Skipped chunk {chunk_index}/{chunk_total} because all samples were dropped.",
+                    )
+                    continue
                 dataset = IBADataset(
                     input_spec=self.input_spec,
-                    open_parameter_values=chunk_open_values,
+                    open_parameter_values=accepted_chunk_open_values,
                     spectra=chunk_spectra,
                     spectra_lengths=chunk_spectra_lengths,
-                    sample_ids=chunk_sample_ids,
+                    sample_ids=accepted_chunk_sample_ids,
                 )
                 file_path = target_dir / f"{base_name}_{chunk_index:06d}.h5"
                 save_dataset(str(file_path), dataset)
@@ -718,8 +769,7 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
             raise last_exc
         raise RuntimeError(f"SIMNRA generation failed for method '{method_name}'.")
 
-    def _simulate_one(self, open_vector: np.ndarray) -> dict[str, np.ndarray]:
-        full_parameter_values = self._build_full_parameter_values(open_vector)
+    def _simulate_one_attempt(self, full_parameter_values: Mapping[str, float]) -> dict[str, np.ndarray]:
         return {
             method.name: self._generate_method_spectrum_with_retries(
                 method.name,
@@ -727,6 +777,120 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
             )
             for method in self.input_spec.methods
         }
+
+    def _compute_validation_chi2(
+        self,
+        primary: np.ndarray,
+        validation: np.ndarray,
+    ) -> float:
+        primary_array = np.asarray(primary, dtype=np.float64)
+        validation_array = np.asarray(validation, dtype=np.float64)
+        if primary_array.shape != validation_array.shape:
+            raise ValueError("Validation chi2 requires equal-length spectra.")
+        if primary_array.ndim != 1:
+            raise ValueError("Validation chi2 requires 1D spectra.")
+        if primary_array.size == 0:
+            return 0.0
+        chi2 = (primary_array - validation_array) ** 2 / (primary_array + 1.0)
+        return float(np.mean(chi2, dtype=np.float64))
+
+    def _validate_attempt_pair(
+        self,
+        primary_result: Mapping[str, np.ndarray],
+        validation_result: Mapping[str, np.ndarray],
+    ) -> _ValidationFailure | None:
+        for method_name in self.validation_methods:
+            primary = np.asarray(primary_result[method_name], dtype=np.float32)
+            validation = np.asarray(validation_result[method_name], dtype=np.float32)
+            primary_length = int(primary.shape[0])
+            validation_length = int(validation.shape[0])
+
+            if self.validation_require_matching_length and primary_length != validation_length:
+                return _ValidationFailure(
+                    method_name=method_name,
+                    reason="length_mismatch",
+                    primary_length=primary_length,
+                    validation_length=validation_length,
+                )
+
+            if primary_length != validation_length:
+                continue
+
+            chi2_value = self._compute_validation_chi2(primary, validation)
+            if chi2_value > self.validation_chi2_threshold:
+                return _ValidationFailure(
+                    method_name=method_name,
+                    reason="chi2_exceeded",
+                    primary_length=primary_length,
+                    validation_length=validation_length,
+                    chi2=chi2_value,
+                )
+
+        return None
+
+    def _build_validation_failure_error(
+        self,
+        failure: _ValidationFailure,
+        *,
+        attempts: int,
+    ) -> RuntimeError:
+        if failure.reason == "length_mismatch":
+            return RuntimeError(
+                "SIMNRA validation failed after "
+                f"{attempts} attempt(s) for method '{failure.method_name}': "
+                f"spectrum length mismatch {failure.primary_length} != {failure.validation_length}."
+            )
+        chi2_value = "nan" if failure.chi2 is None else f"{failure.chi2:.6g}"
+        return RuntimeError(
+            "SIMNRA validation failed after "
+            f"{attempts} attempt(s) for method '{failure.method_name}': "
+            f"chi2={chi2_value} exceeds threshold {self.validation_chi2_threshold:.6g}."
+        )
+
+    def _emit_validation_message(
+        self,
+        *,
+        attempt: int,
+        attempts: int,
+        failure: _ValidationFailure,
+    ) -> None:
+        details = (
+            f"lengths {failure.primary_length} vs {failure.validation_length}"
+            if failure.reason == "length_mismatch"
+            else (
+                f"chi2={failure.chi2:.6g}, threshold={self.validation_chi2_threshold:.6g}, "
+                f"length={failure.primary_length}"
+            )
+        )
+        self._emit_retry_message(
+            "[simnra] Validation failed "
+            f"(attempt {attempt}/{attempts}) for method '{failure.method_name}': {details}"
+        )
+
+    def _simulate_one(self, open_vector: np.ndarray) -> dict[str, np.ndarray]:
+        full_parameter_values = self._build_full_parameter_values(open_vector)
+        if not self.validation_enabled or not self.validation_methods:
+            return self._simulate_one_attempt(full_parameter_values)
+
+        last_failure: _ValidationFailure | None = None
+        attempts = self.validation_max_attempts
+        for attempt in range(1, attempts + 1):
+            primary_result = self._simulate_one_attempt(full_parameter_values)
+            validation_result = self._simulate_one_attempt(full_parameter_values)
+            failure = self._validate_attempt_pair(primary_result, validation_result)
+            if failure is None:
+                return primary_result
+            last_failure = failure
+            if attempt < attempts:
+                self._emit_validation_message(
+                    attempt=attempt,
+                    attempts=attempts,
+                    failure=failure,
+                )
+
+        if last_failure is None:
+            raise RuntimeError("SIMNRA validation failed without an explicit failure reason.")
+        raise self._build_validation_failure_error(last_failure, attempts=attempts)
 
     def _emit_progress(
         self,
@@ -805,15 +969,17 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
     def _generate_spectra_matrices(
         self,
         open_parameter_values: np.ndarray,
+        sample_ids: Sequence[str],
         executor: ThreadPoolExecutor,
         started_at: float,
         chunk_index: int | None = None,
         chunk_total: int | None = None,
         global_offset: int = 0,
         global_total: int | None = None,
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    ) -> tuple[np.ndarray, list[str], dict[str, np.ndarray], dict[str, np.ndarray]]:
         sample_count = open_parameter_values.shape[0]
         if sample_count == 0:
+            empty_open_values = np.zeros((0, open_parameter_values.shape[1]), dtype=np.float32)
             empty_spectra = {
                 method.name: np.zeros((0, 0), dtype=np.float32)
                 for method in self.input_spec.methods
@@ -822,7 +988,7 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                 method.name: np.zeros((0,), dtype=np.int32)
                 for method in self.input_spec.methods
             }
-            return empty_spectra, empty_lengths
+            return empty_open_values, [], empty_spectra, empty_lengths
 
         result_slots: list[dict[str, np.ndarray] | None] = [None] * sample_count
         failures: list[GenerationFailure] = []
@@ -882,25 +1048,33 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
                 f"Generation failed for {len(failures)} sample(s). {details}"
             )
 
+        kept_indexes = [
+            index
+            for index, result in enumerate(result_slots)
+            if result is not None
+        ]
+        accepted_open_values = np.asarray(open_parameter_values[kept_indexes], dtype=np.float32)
+        accepted_sample_ids = [str(sample_ids[index]) for index in kept_indexes]
+        accepted_sample_count = len(kept_indexes)
+
         spectra: dict[str, np.ndarray] = {}
         spectra_lengths: dict[str, np.ndarray] = {}
         for method in self.input_spec.methods:
             method_rows = [
-                result[method.name] if result is not None else None
-                for result in result_slots
+                result_slots[index][method.name]
+                for index in kept_indexes
             ]
             lengths = np.asarray(
                 [
-                    row.shape[0] if row is not None else 0
+                    row.shape[0]
                     for row in method_rows
                 ],
                 dtype=np.int32,
             )
             max_length = int(lengths.max()) if lengths.size else 0
-            padded = np.zeros((sample_count, max_length), dtype=np.float32)
+            padded = np.zeros((accepted_sample_count, max_length), dtype=np.float32)
             for index, row in enumerate(method_rows):
-                if row is not None:
-                    padded[index, : row.shape[0]] = row
+                padded[index, : row.shape[0]] = row
             spectra[method.name] = padded
             spectra_lengths[method.name] = lengths
-        return spectra, spectra_lengths
+        return accepted_open_values, accepted_sample_ids, spectra, spectra_lengths

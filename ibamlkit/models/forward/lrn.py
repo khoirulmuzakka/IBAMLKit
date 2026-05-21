@@ -409,7 +409,13 @@ class LRNModel(ForwardModelBase):
             )
         return self.setup_context_encoder(setup_inputs)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def encode_latent(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the decoder features and setup inputs for a batch.
+
+        The first output is the latent feature vector assembled immediately
+        before the spectrum decoder. The second output is the setup-only input
+        slice reused by the refiner head.
+        """
         self.validate_input_shape(inputs)
         inputs = self.normalize_inputs(inputs)
         setup_inputs, layer_inputs = self.split_inputs(inputs)
@@ -434,6 +440,14 @@ class LRNModel(ForwardModelBase):
             hidden_state = hidden_state * (1.0 - mask) + next_hidden * mask
 
         decoder_input = torch.cat((contribution_total, hidden_state, setup_context), dim=1)
+        return decoder_input, setup_inputs
+
+    def decode_from_latent(
+        self,
+        decoder_input: torch.Tensor,
+        setup_inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode a latent representation back into a spectrum."""
         logits = self.spectrum_decoder(decoder_input)
         coarse_spectrum = F.softplus(logits)
         refined_spectrum = F.softplus(self.spectrum_refiner(coarse_spectrum, setup_inputs))
@@ -441,6 +455,10 @@ class LRNModel(ForwardModelBase):
             device=logits.device,
             dtype=logits.dtype,
         )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        decoder_input, setup_inputs = self.encode_latent(inputs)
+        return self.decode_from_latent(decoder_input, setup_inputs)
     
     @staticmethod
     def _infer_output_size(schema: ForwardModelSchema) -> int:
