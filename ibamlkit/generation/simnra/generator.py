@@ -502,21 +502,24 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
         self.simnra_retry_limit = max(0, int(simnra_retry_limit))
         self.allow_failed_samples = bool(allow_failed_samples)
         self.validation_enabled = bool(validation_enabled)
-        available_method_names = {method.name for method in input_spec.methods}
-        if validation_methods is None:
-            self.validation_methods = tuple(method.name for method in input_spec.methods)
+        if not self.validation_enabled:
+            self.validation_methods = ()
         else:
-            resolved_validation_methods = tuple(str(name) for name in validation_methods)
-            unknown_method_names = sorted(
-                method_name
-                for method_name in resolved_validation_methods
-                if method_name not in available_method_names
-            )
-            if unknown_method_names:
-                raise ValueError(
-                    f"validation_methods contains unknown method names: {unknown_method_names}"
+            available_method_names = {method.name for method in input_spec.methods}
+            if validation_methods is None:
+                self.validation_methods = tuple(method.name for method in input_spec.methods)
+            else:
+                resolved_validation_methods = tuple(str(name) for name in validation_methods)
+                unknown_method_names = sorted(
+                    method_name
+                    for method_name in resolved_validation_methods
+                    if method_name not in available_method_names
                 )
-            self.validation_methods = resolved_validation_methods
+                if unknown_method_names:
+                    raise ValueError(
+                        f"validation_methods contains unknown method names: {unknown_method_names}"
+                    )
+                self.validation_methods = resolved_validation_methods
         self.validation_chi2_threshold = max(0.0, float(validation_chi2_threshold))
         self.validation_max_attempts = max(1, int(validation_max_attempts))
         self.validation_require_matching_length = bool(validation_require_matching_length)
@@ -869,7 +872,9 @@ class SIMNRASpectrumGenerator(SpectrumGenerator):
 
     def _simulate_one(self, open_vector: np.ndarray) -> dict[str, np.ndarray]:
         full_parameter_values = self._build_full_parameter_values(open_vector)
-        if not self.validation_enabled or not self.validation_methods:
+        if not self.validation_enabled:
+            return self._simulate_one_attempt(full_parameter_values)
+        if not self.validation_methods:
             return self._simulate_one_attempt(full_parameter_values)
 
         last_failure: _ValidationFailure | None = None

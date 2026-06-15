@@ -19,7 +19,14 @@ from ibamlkit.schema import (
     ParameterSpec,
     TensorFeatureSpec,
 )
-from ibamlkit.training import ConstantFactorTransform, MinMaxScaler, ModelPackageArtifacts, export_as_package
+from ibamlkit.training import (
+    ConstantFactorTransform,
+    LayerwiseConcentrationNormalizer,
+    ModelPackageArtifacts,
+    ParameterBoundMinMaxScaler,
+    SelectiveMinMaxScaler,
+    export_as_package,
+)
 from ibamlkit.models.forward.base import ForwardModelBase
 
 
@@ -76,7 +83,9 @@ def test_export_as_package_writes_onnx_and_manifest(tmp_path, monkeypatch: pytes
         generation_info={"source": "unit-test"},
     )
 
-    input_scaler = MinMaxScaler(low=-1.0, high=1.0).fit(np.array([[0.0], [2.0]], dtype=np.float32))
+    input_scaler = SelectiveMinMaxScaler(scale_columns=[False, True], low=-1.0, high=1.0).fit(
+        np.array([[0.25, 0.0], [0.75, 2.0]], dtype=np.float32)
+    )
     output_transform = ConstantFactorTransform(2.5).fit(np.zeros((1, 1), dtype=np.float32))
 
     def _fake_onnx_export(*args, **kwargs) -> None:
@@ -106,9 +115,99 @@ def test_export_as_package_writes_onnx_and_manifest(tmp_path, monkeypatch: pytes
     assert manifest["format"] == "ibamlkit.onnx-package"
     assert manifest["dataset"]["generation_info"]["source"] == "unit-test"
     assert manifest["dataset"]["parameters"][0]["name"] == "x0"
-    assert manifest["preprocessing"]["input_scaler"]["type"] == "MinMaxScaler"
+    assert manifest["preprocessing"]["input_scaler"]["type"] == "SelectiveMinMaxScaler"
+    assert manifest["preprocessing"]["input_scaler"]["scale_columns"] == [False, True]
     assert manifest["preprocessing"]["output_transform"]["type"] == "ConstantFactorTransform"
     assert manifest["metadata"]["experiment"] == "demo"
+
+
+def test_export_as_package_serializes_layerwise_concentration_normalizer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _DummyForwardModel()
+    input_spec = DatasetInputSpec(
+        methods=[MethodSpec(name="m")],
+        layer_species=[LayerSpeciesSpec(layer_index=1, element="Si")],
+        parameters=[
+            ParameterSpec(name="x0", group="setup", kind="scalar", is_open=True),
+            ParameterSpec(name="x1", group="setup", kind="scalar", is_open=True),
+        ],
+        generation_info={"source": "unit-test"},
+    )
+    input_transform = LayerwiseConcentrationNormalizer(
+        setup_feature_count=1,
+        layer_param_size=1,
+        layer_feature_indices=((1,),),
+        concentration_indices=((0,),),
+        runtime_prefix_layout=True,
+    ).fit(np.array([[0.25, 0.5], [0.75, 1.0]], dtype=np.float32))
+
+    def _fake_onnx_export(*args, **kwargs) -> None:
+        output_path = args[2]
+        with open(output_path, "wb") as handle:
+            handle.write(b"onnx-placeholder")
+
+    monkeypatch.setattr(torch.onnx, "export", _fake_onnx_export)
+
+    package_dir = export_as_package(
+        model,
+        ModelPackageArtifacts(
+            input_spec=input_spec,
+            input_scaler=input_transform,
+        ),
+        tmp_path,
+    )
+
+    manifest = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
+    serialized = manifest["preprocessing"]["input_scaler"]
+    assert serialized["type"] == "LayerwiseConcentrationNormalizer"
+    assert serialized["setup_feature_count"] == 1
+    assert serialized["layer_param_size"] == 1
+    assert serialized["runtime_prefix_layout"] is True
+    assert serialized["concentration_indices"] == [[0]]
+
+
+def test_export_as_package_serializes_parameter_bound_minmax_scaler(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _DummyForwardModel()
+    input_spec = DatasetInputSpec(
+        methods=[MethodSpec(name="m")],
+        layer_species=[LayerSpeciesSpec(layer_index=1, element="Si")],
+        parameters=[
+            ParameterSpec(name="x0", group="setup", kind="beam_energy", is_open=True),
+            ParameterSpec(name="x1", group="layer", kind="thickness", is_open=True, layer_index=1),
+        ],
+        generation_info={"source": "unit-test"},
+    )
+    input_transform = ParameterBoundMinMaxScaler.from_parameters(
+        input_spec.open_parameters,
+        fixed_bounds_by_kind={"thickness": (0.0, 100000.0)},
+    ).fit(np.array([[2500.0, 1000.0], [3500.0, 2000.0]], dtype=np.float32))
+
+    def _fake_onnx_export(*args, **kwargs) -> None:
+        output_path = args[2]
+        with open(output_path, "wb") as handle:
+            handle.write(b"onnx-placeholder")
+
+    monkeypatch.setattr(torch.onnx, "export", _fake_onnx_export)
+
+    package_dir = export_as_package(
+        model,
+        ModelPackageArtifacts(
+            input_spec=input_spec,
+            input_scaler=input_transform,
+        ),
+        tmp_path,
+    )
+
+    manifest = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
+    serialized = manifest["preprocessing"]["input_scaler"]
+    assert serialized["type"] == "ParameterBoundMinMaxScaler"
+    assert serialized["fixed_bounds_by_kind"] == {"thickness": [0.0, 100000.0]}
+    assert serialized["fixed_range_columns"] == [False, True]
 
 
 def test_export_as_package_writes_zip_archive(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

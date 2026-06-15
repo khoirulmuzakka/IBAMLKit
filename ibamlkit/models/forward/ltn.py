@@ -10,65 +10,8 @@ from torch import nn
 
 from .base import ForwardModelBase
 from .lrn import LRNModel
+from .refiners import LocalSpectrumRefiner
 from ibamlkit.schema import ForwardModelSchema
-
-
-class _LocalSpectrumRefiner(nn.Module):
-    """Lightweight setup-conditioned local residual correction."""
-
-    def __init__(
-        self,
-        *,
-        setup_dim: int,
-        hidden_channels: int,
-        kernel_size: int,
-    ) -> None:
-        super().__init__()
-        if kernel_size < 1:
-            raise ValueError("kernel_size must be >= 1.")
-        if hidden_channels < 1:
-            raise ValueError("hidden_channels must be >= 1.")
-
-        self.kernel_size = int(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
-        self.padding = self.kernel_size // 2
-        self._use_dummy_setup = setup_dim <= 0
-        effective_setup_dim = 1 if self._use_dummy_setup else setup_dim
-
-        self.in_projection = nn.Conv1d(1, hidden_channels, kernel_size=self.kernel_size, padding=self.padding)
-        self.residual_conv = nn.Conv1d(
-            hidden_channels,
-            hidden_channels,
-            kernel_size=self.kernel_size,
-            padding=self.padding,
-        )
-        self.out_projection = nn.Conv1d(hidden_channels, 1, kernel_size=1)
-        self.setup_to_film = nn.Sequential(
-            nn.Linear(effective_setup_dim, hidden_channels * 2),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_channels * 2, hidden_channels * 2),
-        )
-
-    def forward(self, spectra: torch.Tensor, setup_inputs: torch.Tensor) -> torch.Tensor:
-        if self._use_dummy_setup:
-            setup_inputs = torch.ones(
-                (spectra.shape[0], 1),
-                device=spectra.device,
-                dtype=spectra.dtype,
-            )
-
-        features = self.in_projection(spectra.unsqueeze(1))
-        gamma, beta = torch.chunk(
-            self.setup_to_film(setup_inputs.to(device=spectra.device, dtype=spectra.dtype)),
-            2,
-            dim=1,
-        )
-        gamma = torch.tanh(gamma).unsqueeze(-1) + 1.0
-        beta = beta.unsqueeze(-1)
-        features = F.leaky_relu(features * gamma + beta)
-        residual = self.residual_conv(features)
-        residual = F.leaky_relu(residual + features)
-        residual = self.out_projection(residual).squeeze(1)
-        return spectra + residual
 
 
 class LTNModel(ForwardModelBase):
@@ -104,7 +47,6 @@ class LTNModel(ForwardModelBase):
             torch.tensor(indices, dtype=torch.int64)
             for indices in layout.layer_feature_indices
         )
-        self.concentration_indices = [list(offsets) for offsets in layout.concentration_feature_offsets]
 
         self.layer_projection = nn.Linear(max(self.layer_param_size, 1), model_dim)
         self.setup_projection = nn.Linear(max(self.setup_param_size, 1), model_dim)
@@ -135,35 +77,12 @@ class LTNModel(ForwardModelBase):
             prev = width
         decoder_layers.append(nn.Linear(prev, self.output_size))
         self.spectrum_decoder = nn.Sequential(*decoder_layers)
-        self.spectrum_refiner = _LocalSpectrumRefiner(
+        self.spectrum_refiner = LocalSpectrumRefiner(
             setup_dim=self.setup_param_size,
             hidden_channels=refiner_hidden_channels,
             kernel_size=refiner_kernel_size,
         )
         self.output_scale = nn.Parameter(torch.ones(self.output_size), requires_grad=True)
-
-    def normalize_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.concentration_indices or self.layer_param_size <= 0:
-            return inputs
-
-        normalized = inputs.clone()
-        for layer_index, concentration_indices in enumerate(self.concentration_indices):
-            if not concentration_indices:
-                continue
-            current = normalized.index_select(
-                dim=1,
-                index=self.layer_feature_indices[layer_index].to(device=inputs.device),
-            )
-            concentrations = current[:, concentration_indices].clamp_min(0.0)
-            sums = concentrations.sum(dim=1, keepdim=True)
-            concentrations = concentrations / torch.where(
-                sums > 0.0,
-                sums,
-                torch.ones_like(sums),
-            )
-            current[:, concentration_indices] = concentrations
-            normalized[:, self.layer_feature_indices[layer_index].to(device=inputs.device)] = current
-        return normalized
 
     def split_inputs(self, inputs: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if self.setup_param_size > 0:
@@ -190,7 +109,6 @@ class LTNModel(ForwardModelBase):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         self.validate_input_shape(inputs)
-        inputs = self.normalize_inputs(inputs)
         setup_inputs, layer_inputs = self.split_inputs(inputs)
         batch_size = inputs.shape[0]
 

@@ -19,7 +19,10 @@ from ibamlkit.training.preprocessing import (
     ArrayTransform,
     ConstantFactorTransform,
     IdentityTransform,
+    LayerwiseConcentrationNormalizer,
     MinMaxScaler,
+    ParameterBoundMinMaxScaler,
+    SelectiveMinMaxScaler,
     StandardScaler,
     TransformPipeline,
 )
@@ -289,6 +292,53 @@ def _transform_to_dict(transform: ArrayTransform | None) -> dict[str, Any] | Non
             "x_scale": None
             if transform.x_scale is None
             else transform.x_scale.astype(np.float32).tolist(),
+        }
+    if isinstance(transform, SelectiveMinMaxScaler):
+        return {
+            "type": "SelectiveMinMaxScaler",
+            "is_fitted": bool(transform.is_fitted),
+            "input_dimension": transform.input_dimension,
+            "low": float(transform.low),
+            "high": float(transform.high),
+            "scale_columns": transform.scale_columns.astype(bool).tolist(),
+            "x_min": None if transform.x_min is None else transform.x_min.astype(np.float32).tolist(),
+            "x_scale": None
+            if transform.x_scale is None
+            else transform.x_scale.astype(np.float32).tolist(),
+        }
+    if isinstance(transform, ParameterBoundMinMaxScaler):
+        return {
+            "type": "ParameterBoundMinMaxScaler",
+            "is_fitted": bool(transform.is_fitted),
+            "input_dimension": transform.input_dimension,
+            "low": float(transform.low),
+            "high": float(transform.high),
+            "parameter_kinds": list(transform.parameter_kinds),
+            "setup_feature_count": int(transform.setup_feature_count),
+            "layer_param_size": int(transform.layer_param_size),
+            "runtime_prefix_layout": bool(transform.runtime_prefix_layout),
+            "passthrough_kinds": sorted(transform.passthrough_kinds),
+            "fixed_bounds_by_kind": {
+                kind: [float(bounds[0]), float(bounds[1])]
+                for kind, bounds in transform.fixed_bounds_by_kind.items()
+            },
+            "scale_columns": transform.scale_columns.astype(bool).tolist(),
+            "fixed_range_columns": transform.fixed_range_columns.astype(bool).tolist(),
+            "x_min": None if transform.x_min is None else transform.x_min.astype(np.float32).tolist(),
+            "x_scale": None
+            if transform.x_scale is None
+            else transform.x_scale.astype(np.float32).tolist(),
+        }
+    if isinstance(transform, LayerwiseConcentrationNormalizer):
+        return {
+            "type": "LayerwiseConcentrationNormalizer",
+            "is_fitted": bool(transform.is_fitted),
+            "input_dimension": transform.input_dimension,
+            "setup_feature_count": int(transform.setup_feature_count),
+            "layer_param_size": int(transform.layer_param_size),
+            "layer_feature_indices": [list(group) for group in transform.layer_feature_indices],
+            "concentration_indices": [list(group) for group in transform.concentration_indices],
+            "runtime_prefix_layout": bool(transform.runtime_prefix_layout),
         }
     if isinstance(transform, StandardScaler):
         return {

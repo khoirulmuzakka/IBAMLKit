@@ -348,7 +348,13 @@ def main() -> None:
         },
     )
 
-    generator = SIMNRASpectrumGenerator(input_spec=input_spec, max_workers=n_threads)
+    generator = SIMNRASpectrumGenerator(
+        input_spec=input_spec,
+        max_workers=n_threads,
+        validation_enabled=True,
+        validation_chi2_threshold=10.0,
+        validation_max_attempts=3,
+    )
     written_files = generator.generate_to_files(
         open_parameter_values=open_parameter_values,
         output_dir=str(output_dir),

@@ -10,7 +10,7 @@ from torch import nn
 
 
 from .base import ForwardModelBase
-from .base import ForwardModelBase
+from .refiners import LocalSpectrumRefiner
 from ibamlkit.schema import (
     DatasetInputSpec,
     ForwardModelSchema,
@@ -216,65 +216,6 @@ class _LayerwiseGRUBlock(nn.Module):
         return contribution, next_hidden
 
 
-class _LocalSpectrumRefiner(nn.Module):
-    """Inject local channel structure through a lightweight conv residual head."""
-
-    def __init__(
-        self,
-        *,
-        output_size: int,
-        setup_dim: int,
-        hidden_channels: int,
-        kernel_size: int,
-    ) -> None:
-        super().__init__()
-        if kernel_size < 1:
-            raise ValueError("kernel_size must be >= 1.")
-        if hidden_channels < 1:
-            raise ValueError("hidden_channels must be >= 1.")
-
-        self.output_size = int(output_size)
-        self.hidden_channels = int(hidden_channels)
-        self.kernel_size = int(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
-        self.padding = self.kernel_size // 2
-        self._use_dummy_setup = setup_dim <= 0
-        effective_setup_dim = 1 if self._use_dummy_setup else setup_dim
-
-        self.in_projection = nn.Conv1d(1, hidden_channels, kernel_size=self.kernel_size, padding=self.padding)
-        self.residual_conv = nn.Conv1d(
-            hidden_channels,
-            hidden_channels,
-            kernel_size=self.kernel_size,
-            padding=self.padding,
-        )
-        self.out_projection = nn.Conv1d(hidden_channels, 1, kernel_size=1)
-        self.setup_to_film = nn.Sequential(
-            nn.Linear(effective_setup_dim, hidden_channels * 2),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_channels * 2, hidden_channels * 2),
-        )
-
-    def forward(self, spectra: torch.Tensor, setup_inputs: torch.Tensor) -> torch.Tensor:
-        if self._use_dummy_setup:
-            setup_inputs = torch.ones(
-                (spectra.shape[0], 1),
-                device=spectra.device,
-                dtype=spectra.dtype,
-            )
-
-        features = self.in_projection(spectra.unsqueeze(1))
-        gamma, beta = torch.chunk(
-            self.setup_to_film(setup_inputs.to(device=spectra.device, dtype=spectra.dtype)),
-            2,
-            dim=1,
-        )
-        gamma = torch.tanh(gamma).unsqueeze(-1) + 1.0
-        beta = beta.unsqueeze(-1)
-        features = F.leaky_relu(features * gamma + beta)
-        residual = self.residual_conv(features)
-        residual = F.leaky_relu(residual + features)
-        residual = self.out_projection(residual).squeeze(1)
-        return spectra + residual
 
 
 class LRNModel(ForwardModelBase):
@@ -315,8 +256,8 @@ class LRNModel(ForwardModelBase):
             torch.tensor(indices, dtype=torch.int64)
             for indices in layout.layer_feature_indices
         )
-        self.concentration_indices = [list(offsets) for offsets in layout.concentration_feature_offsets]
         self.layer_feature_names = layout.layer_feature_names
+        self._runtime_prefix_layout = self._has_prefix_runtime_layout(layout)
 
         self.setup_context_encoder = nn.Sequential(
             nn.Linear(max(self.setup_param_size, 1), setup_embedding_dim),
@@ -341,62 +282,95 @@ class LRNModel(ForwardModelBase):
             prev = width
         decoder_layers.append(nn.Linear(prev, self.output_size))
         self.spectrum_decoder = nn.Sequential(*decoder_layers)
-        self.spectrum_refiner = _LocalSpectrumRefiner(
-            output_size=self.output_size,
+        self.spectrum_refiner = LocalSpectrumRefiner(
             setup_dim=self.setup_param_size,
             hidden_channels=refiner_hidden_channels,
             kernel_size=refiner_kernel_size,
         )
         self.output_scale = nn.Parameter(torch.ones(self.output_size), requires_grad=True)
 
-    def normalize_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.concentration_indices or self.layer_param_size <= 0:
-            return inputs
+    @staticmethod
+    def _has_prefix_runtime_layout(layout: _InputLayout) -> bool:
+        expected_setup = tuple(range(len(layout.setup_feature_indices)))
+        if layout.setup_feature_indices != expected_setup:
+            return False
 
-        normalized = inputs.clone()
-        for layer_index, concentration_indices in enumerate(self.concentration_indices):
-            if not concentration_indices:
-                continue
-            layer_indices = self.layer_feature_indices[layer_index].to(device=inputs.device)
-            concentration_index = torch.tensor(
-                concentration_indices,
-                device=inputs.device,
-                dtype=torch.long,
+        offset = len(layout.setup_feature_indices)
+        for layer_indices in layout.layer_feature_indices:
+            expected_layer = tuple(range(offset, offset + len(layer_indices)))
+            if layer_indices != expected_layer:
+                return False
+            offset += len(layer_indices)
+        return True
+
+    def validate_input_shape(self, inputs: torch.Tensor) -> None:
+        if inputs.ndim != 2:
+            raise ValueError("Model inputs must be a 2D tensor of shape (batch, features).")
+        feature_count = int(inputs.shape[1])
+        if feature_count == self.input_dimension:
+            return
+        if self.training:
+            raise ValueError(
+                f"Expected {self.input_dimension} input features during training, got {feature_count}."
             )
-            current = normalized.index_select(
-                dim=1,
-                index=layer_indices,
+        if not self._runtime_prefix_layout:
+            raise ValueError(
+                "Variable-length LRN inference requires setup features followed by contiguous "
+                "per-layer feature blocks in schema order."
             )
-            concentrations = current.index_select(dim=1, index=concentration_index).clamp_min(0.0)
-            sums = concentrations.sum(dim=1, keepdim=True)
-            concentrations = concentrations / torch.where(
-                sums > 0.0,
-                sums,
-                torch.ones_like(sums),
+        if feature_count < self.setup_param_size:
+            raise ValueError(
+                f"Expected at least {self.setup_param_size} setup features, got {feature_count}."
             )
-            current = current.scatter(
-                dim=1,
-                index=concentration_index.unsqueeze(0).expand(current.shape[0], -1),
-                src=concentrations,
+        if self.layer_param_size <= 0:
+            raise ValueError(
+                f"Expected {self.input_dimension} input features, got {feature_count}."
             )
-            normalized = normalized.scatter(
-                dim=1,
-                index=layer_indices.unsqueeze(0).expand(inputs.shape[0], -1),
-                src=current,
+        layer_feature_count = feature_count - self.setup_param_size
+        if layer_feature_count % self.layer_param_size != 0:
+            raise ValueError(
+                "Variable-length LRN inputs must use the layout "
+                f"setup + N * layer_features, where layer_features={self.layer_param_size}. "
+                f"Got {feature_count} features."
             )
-        return normalized
+
+    def _runtime_layer_count(self, feature_count: int) -> int:
+        if feature_count < self.setup_param_size:
+            raise ValueError(
+                f"Expected at least {self.setup_param_size} setup features, got {feature_count}."
+            )
+        if self.layer_param_size <= 0:
+            return 0
+        return (feature_count - self.setup_param_size) // self.layer_param_size
 
     def split_inputs(self, inputs: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if inputs.shape[1] == self.input_dimension:
+            if self.setup_param_size > 0:
+                setup = inputs.index_select(
+                    dim=1,
+                    index=self.setup_feature_indices.to(device=inputs.device),
+                )
+            else:
+                setup = inputs.new_zeros((inputs.shape[0], 0))
+            layers = [
+                inputs.index_select(dim=1, index=indices.to(device=inputs.device))
+                for indices in self.layer_feature_indices
+            ]
+            return setup, layers
+
         if self.setup_param_size > 0:
-            setup = inputs.index_select(
-                dim=1,
-                index=self.setup_feature_indices.to(device=inputs.device),
-            )
+            setup = inputs[:, : self.setup_param_size]
         else:
             setup = inputs.new_zeros((inputs.shape[0], 0))
+
+        layer_count = self._runtime_layer_count(int(inputs.shape[1]))
         layers = [
-            inputs.index_select(dim=1, index=indices.to(device=inputs.device))
-            for indices in self.layer_feature_indices
+            inputs[
+                :,
+                self.setup_param_size + layer_index * self.layer_param_size :
+                self.setup_param_size + (layer_index + 1) * self.layer_param_size,
+            ]
+            for layer_index in range(layer_count)
         ]
         return setup, layers
 
@@ -417,7 +391,6 @@ class LRNModel(ForwardModelBase):
         slice reused by the refiner head.
         """
         self.validate_input_shape(inputs)
-        inputs = self.normalize_inputs(inputs)
         setup_inputs, layer_inputs = self.split_inputs(inputs)
 
         batch_size = inputs.shape[0]

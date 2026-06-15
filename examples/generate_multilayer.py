@@ -88,7 +88,7 @@ def build_setup_parameters() -> list[ParameterSpec]:
             is_open=False,
             lower_bound=2655.0,
             upper_bound=3245.0,
-            fixed_value=2950.0,
+            fixed_value=2974.0,
             unit="keV",
         ),
         ParameterSpec(
@@ -117,9 +117,9 @@ def build_setup_parameters() -> list[ParameterSpec]:
             kind="calibration_linear",
             method="NRA",
             is_open=False,
-            lower_bound=7.1725,
+            lower_bound=0.1725,
             upper_bound=7.9275,
-            fixed_value=7.55,
+            fixed_value=2.5,
         ),
         ParameterSpec(
             name="Calib_Linear_RBS",
@@ -127,9 +127,9 @@ def build_setup_parameters() -> list[ParameterSpec]:
             kind="calibration_linear",
             method="RBS",
             is_open=False,
-            lower_bound=2.50528,
-            upper_bound=2.769,
-            fixed_value=2.637,
+            lower_bound=0.50528,
+            upper_bound=10.769,
+            fixed_value=2.5,
         ),
         ParameterSpec(
             name="Calib_Offset_NRA",
@@ -169,7 +169,7 @@ def build_setup_parameters() -> list[ParameterSpec]:
             is_open=False,
             lower_bound=-0.01,
             upper_bound=0.01,
-            fixed_value=-1.47615e-05,
+            fixed_value=0.0,
         ),
         ParameterSpec(
             name="FWHM_NRA",
@@ -189,7 +189,7 @@ def build_setup_parameters() -> list[ParameterSpec]:
             is_open=False,
             lower_bound=0.0,
             upper_bound=44.0,
-            fixed_value=22.0,
+            fixed_value=20.0,
         ),
         ParameterSpec(
             name="ParticlesSr_NRA",
@@ -215,7 +215,8 @@ def build_setup_parameters() -> list[ParameterSpec]:
 
 
 def build_layer_elements() -> list[str]:
-    return ["Li", "C", "O", "F", "Si", "P",  "Fe", "Al", "Mn", "Sr", "Ti", "K", "Ca" , "Cu"]
+    return ["Li", "C", "O", "F", "Si", "P", "Cu"]
+    #return ["Li", "C", "O", "F", "Si", "P",  "Fe", "Al", "Mn", "Sr", "Ti", "K", "Ca" , "Cu"]
 
 
 def make_layer_species(n_layers: int, elements: Sequence[str]) -> list[LayerSpeciesSpec]:
@@ -389,15 +390,15 @@ def build_layer_sampling_config(
 
 
 def main() -> None:
-    max_layers = 10
+    max_layers = 15
     base_seed = 1
-    n_samples_per_case = [100000 for _ in range(max_layers)]
+    n_samples_per_case = [15000 for _ in range(max_layers)]
     n_threads = 90
     progress_every = 10000
     thickness_growth_ratio = 1.6
     total_thickness_min_sum = 5.0e4
     total_thickness_max_sum = 7.0e5
-    output_root = Path(f"datasets/multilayer_14_elements_seed_{base_seed}")
+    output_root = Path(f"datasets/multilayer_7_elements_seed_{base_seed}_11_15_layers")
     default_layer_sampling = LayerConcentrationSamplingConfig(
         anchor_fraction=0.05,
         pure_weight=0.15,
@@ -426,7 +427,7 @@ def main() -> None:
     if len(n_samples_per_case) != max_layers:
         raise ValueError("n_samples_per_case must define one entry for each layer-count case.")
 
-    for n_layers in range(1, max_layers + 1):
+    for n_layers in range(11, max_layers + 1):
         case_seed = base_seed + n_layers
         case_sample_count = int(n_samples_per_case[n_layers - 1])
         upper_bounds = thickness_upper_bounds(
@@ -472,6 +473,9 @@ def main() -> None:
             print_progress=True,
             simnra_retry_limit=3,
             allow_failed_samples=True,
+            validation_enabled=False,
+            validation_chi2_threshold=10.0,
+            validation_max_attempts=3,
             log_concentration_corrections=True,
             concentration_correction_threshold=1e-4,
         )
